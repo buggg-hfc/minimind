@@ -6,6 +6,7 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import ast
+import inspect
 import operator
 import random
 import math
@@ -47,9 +48,14 @@ def init_distributed_mode():
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    # Form the NCCL communicator on this GPU before DDP verifies parameters.
+    if "device_id" in inspect.signature(dist.init_process_group).parameters:
+        dist.init_process_group(backend="nccl", device_id=device)
+    else:
+        dist.init_process_group(backend="nccl")
     return local_rank
 
 

@@ -1,14 +1,46 @@
-"""Exercise the pretraining accumulation windows without CUDA or a rendezvous."""
+"""Exercise distributed initialization and accumulation without a GPU rendezvous."""
+import os
 import tempfile
 import unittest
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 from torch import nn
 
 from trainer import train_pretrain as trainer
+from trainer import trainer_utils
+
+
+class DistributedInitTest(unittest.TestCase):
+    def test_init_uses_the_bound_local_device(self):
+        for eager in (True, False):
+            with self.subTest(eager=eager):
+                events = Mock()
+
+                def init_eager(backend, device_id):
+                    events.init(backend, device_id)
+
+                def init_legacy(backend):
+                    events.init(backend)
+
+                device = torch.device("cuda", 3)
+                with patch.dict(os.environ, {"RANK": "11", "LOCAL_RANK": "3"}), \
+                     patch.object(torch.cuda, "set_device", events.bind), \
+                     patch.object(trainer_utils.dist, "init_process_group", init_eager if eager else init_legacy):
+                    self.assertEqual(trainer_utils.init_distributed_mode(), 3)
+                self.assertEqual(events.mock_calls, [
+                    call.bind(device), call.init("nccl", device) if eager else call.init("nccl"),
+                ])
+
+    def test_single_process_skips_distributed_setup(self):
+        with patch.dict(os.environ, {"RANK": "-1"}), \
+             patch.object(torch.cuda, "set_device") as bind, \
+             patch.object(trainer_utils.dist, "init_process_group") as init:
+            self.assertEqual(trainer_utils.init_distributed_mode(), 0)
+            bind.assert_not_called()
+            init.assert_not_called()
 
 
 class RecordingDDP(nn.Module):
