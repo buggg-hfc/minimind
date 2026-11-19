@@ -4,8 +4,8 @@ import unittest
 import torch
 from torch import nn
 
-from model.quant_formats import quantize
-from model.quant_linear import install_quantization
+from model.quant_formats import bf16_residual, quantize
+from model.quant_linear import gemm, install_quantization
 
 
 SCHEMES = ("bf16", "mxfp8", "hif4_thr_3mm", "nvfp4_3mm", "nvint4_3mm")
@@ -20,13 +20,17 @@ def reference_mm(a, b, scheme, backward_dy=False):
     """Explicit three independent mm calls, grouped on the logical K dimension."""
     a = bf16(a)
     b = bf16(b)
-    ts = backward_dy and scheme in NV_SCHEMES
+    ts = False
+    if backward_dy and scheme in NV_SCHEMES:
+        maximum = a.float().abs().max()
+        qmax = 6 if scheme == "nvfp4_3mm" else 7
+        ts = torch.where(maximum == 0, 1.0, (maximum / (qmax * 114688.0)).clamp_min(2.0 ** -149))
     a0 = quantize(a, scheme, axis=1, tensor_scale=ts)
     b0 = quantize(b, scheme, axis=0)
     out = a0 @ b0
     if scheme.endswith("_3mm"):
-        a1 = quantize(a - a0, scheme, axis=1, tensor_scale=ts)
-        b1 = quantize(b - b0, scheme, axis=0)
+        a1 = quantize((a.bfloat16() - a0.bfloat16()).float(), scheme, axis=1, tensor_scale=ts)
+        b1 = quantize((b.bfloat16() - b0.bfloat16()).float(), scheme, axis=0)
         out = (out + a1 @ b0) + a0 @ b1
     return bf16(out)
 
@@ -65,6 +69,41 @@ class QuantizerTests(unittest.TestCase):
                 self.assertEqual(out[1:, 0].tolist(), [qmax, qmax * 114688.0, 0])
                 with_ts = quantize(x[3:], scheme, tensor_scale=True)
                 torch.testing.assert_close(with_ts, x[3:], atol=0, rtol=2e-6)
+
+    def test_both_inputs_and_result_of_subtraction_are_bf16(self):
+        a = torch.tensor([1.003, 3.0])
+        main = torch.tensor([0.999, -2.0 ** -7])
+        result = bf16_residual(a, main)
+        self.assertEqual(result.dtype, torch.float32)
+        self.assertEqual(result.tolist(), [0.0, 3.0])
+        self.assertNotEqual(result[0].item(), bf16(a - main)[0].item())
+        self.assertNotEqual(result[1].item(), (bf16(a) - bf16(main))[1].item())
+
+    def test_nv_residual_reuses_tensor_scale_and_refits_group_scale(self):
+        gen = torch.Generator().manual_seed(0)
+        a = bf16(torch.randn(5, 33, generator=gen) * 1.287)
+        b = bf16(torch.randn(33, 11, generator=gen) * 1.91)
+        for scheme, qmax in zip(NV_SCHEMES, (6, 7)):
+            with self.subTest(scheme=scheme):
+                # Separate reference: normalize by the main FP32 scale manually.
+                # Both calls choose group scales using their own 16-element blocks.
+                ts = a.abs().amax() / (qmax * 114688.0)
+                a0 = quantize(a / ts, scheme, axis=1) * ts
+                a_diff = (a.bfloat16() - a0.bfloat16()).float()
+                a1 = quantize(a_diff / ts, scheme, axis=1) * ts
+                b0 = quantize(b, scheme, axis=0)
+                b_diff = (b.bfloat16() - b0.bfloat16()).float()
+                b1 = quantize(b_diff, scheme, axis=0)
+                expected = (a0 @ b0 + a1 @ b0) + a0 @ b1
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    result = gemm(a, b, scheme, lhs_is_dy=True)
+                torch.testing.assert_close(result, expected, atol=0, rtol=0)
+                self.assertEqual(result.dtype, torch.float32)
+                self.assertFalse(torch.equal(result, bf16(expected)))
+                wrong_scale = quantize(a_diff, scheme, axis=1, tensor_scale=True)
+                wrong_domain = quantize((a - a0) / ts, scheme, axis=1) * ts
+                for wrong in (wrong_scale, wrong_domain):
+                    self.assertFalse(torch.equal(result, (a0 @ b0 + wrong @ b0) + a0 @ b1))
 
     def test_tail_groups_strides_and_empty_inputs(self):
         torch.manual_seed(13)
