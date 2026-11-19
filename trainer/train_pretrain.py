@@ -23,22 +23,29 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    start_time = time.time()
+    start_time = last_log_time = time.perf_counter()
+    window_tokens = torch.zeros((), dtype=torch.int64, device=args.device)
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
+        input_ids = input_ids.to(args.device, non_blocking=True)
+        labels = labels.to(args.device, non_blocking=True)
+        window_tokens.add_(labels[..., 1:].ne(-100).sum())
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with autocast_ctx:
-            res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+        previous_update = ((step - 1) // args.accumulation_steps) * args.accumulation_steps
+        next_update = min(previous_update + args.accumulation_steps, iters)
+        accumulation_size = next_update - max(previous_update, start_step)
+        update = step == next_update
+        sync_ctx = model.no_sync() if isinstance(model, DistributedDataParallel) and not update else nullcontext()
+        # DDP checks its synchronization flag during forward as well as backward.
+        with sync_ctx:
+            with autocast_ctx:
+                res = model(input_ids, labels=labels)
+                loss = (res.loss + res.aux_loss) / accumulation_size
+            scaler.scale(loss).backward()
 
-        scaler.scale(loss).backward()
-
-        if step % args.accumulation_steps == 0 or step == iters:
+        if update:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -48,20 +55,24 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+            if dist.is_initialized():
+                dist.all_reduce(window_tokens, op=dist.ReduceOp.SUM)
+            valid_tokens = window_tokens.item()  # Wait for this interval's device work.
+            now = time.perf_counter()
+            tokens_per_second = valid_tokens / (now - last_log_time)
+            last_log_time = now
+            window_tokens.zero_()
+            spend_time = now - start_time
+            current_loss = loss.item() * accumulation_size
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min, valid_tokens/s: {tokens_per_second:.0f}')
+            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min, "valid_tokens_per_second": tokens_per_second})
 
-        save_due = step % args.save_interval == 0
-        if args.quant_sim != 'none':
-            # Resume files contain optimizer-boundary state, not pending microbatch gradients.
-            save_due = (step % args.accumulation_steps == 0 and
-                        step // args.save_interval > max(0, step - args.accumulation_steps) // args.save_interval)
+        # Resume files contain optimizer-boundary state, not pending gradients.
+        save_due = update and step // args.save_interval > previous_update // args.save_interval
         if (save_due or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -164,14 +175,20 @@ if __name__ == "__main__":
         model = torch.compile(model)
         Logger('torch.compile enabled')
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        # The only model buffers are deterministic RoPE tables, identical on every rank.
+        model = DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False,
+                                        gradient_as_bucket_view=True)
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(args.seed + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(args.seed + epoch)
+        if train_sampler is None:
+            indices = torch.randperm(len(train_ds)).tolist()
+        else:
+            train_sampler.set_epoch(epoch)
+            indices = train_sampler
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
-        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        batch_sampler = SkipBatchSampler(indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')

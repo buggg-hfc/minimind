@@ -681,7 +681,7 @@ cd trainer
 torchrun --standalone --nproc_per_node=8 train_pretrain.py \
   --use_moe 0 --quant_sim hif4_thr_3mm --from_weight none \
   --data_path ../dataset/pretrain_t2t_mini.jsonl --max_seq_len 512 \
-  --batch_size 2 --accumulation_steps 4 --seed 42
+  --batch_size 2 --accumulation_steps 4 --num_workers 2 --seed 42
 ```
 
 将 `--use_moe` 设为 `1` 即可训练原版 4 专家 top-1 MoE。比较格式时固定数据、初始化种子、每卡 batch 和设备数；dW 沿每个 microbatch 内的 token 维分组，专家层只使用分配给该专家的 token。
@@ -707,6 +707,23 @@ NV 两组的 UE5M3 使用 5 位指数、3 位尾数、偏置 15，最小正值�
 python eval_llm.py --use_moe 1 --weight pretrain_hif4_thr_3mm --quant_sim hif4_thr_3mm
 python -m unittest discover -s tests -p 'test_v100*.py' -v
 ```
+
+**单机八卡训练调优。** DDP 每张卡保存一个模型副本，按 rank 分配训练样本。上例每次更新共处理 `8 × 2 × 4 = 64` 条序列。累积的中间微批在本卡计算梯度，更新前进行一次梯度同步。训练日志的 `valid_tokens/s` 是整个作业每秒处理的有效预测 token 数，已排除 padding 和首个无预测目标的位置。日志窗口包含数据加载及期间发生的保存开销。
+
+在同一格式和固定输入长度下，可比较每卡 batch 与累积步数组合 `2×4`、`4×2`、`8×1`。观察稳定阶段若干日志窗口，同时记录单卡峰值显存，选择能留出显存余量且有效 tokens/s 较高的组合。正式精度比较统一每卡 batch，因为改变它会改变 dW 沿 token 维的分组。数据先放本机 SSD，`--num_workers` 按每个进程计，示例在八卡共启动 16 个加载进程。
+
+**八卡离线生成。** 准备 UTF-8 JSONL，每行一个对象，例如 `{"id":1,"prompt":"什么是量化？"}`。在仓库根目录运行：
+
+```bash
+torchrun --standalone --nproc_per_node=8 eval_llm.py \
+  --use_moe 1 --weight pretrain_hif4_thr_3mm --quant_sim hif4_thr_3mm \
+  --prompts_jsonl prompts.jsonl --output_jsonl responses.jsonl \
+  --batch_size 4 --max_new_tokens 128 --weight_cache_mib 2048
+```
+
+每个 rank 用一张卡，离线模式按输入行分片、逐卡合批做贪心解码并使用 KV cache。rank 0 按输入顺序写回原字段及 `response`、`generated_tokens`，结束时打印整机生成 tokens/s。每卡 batch 为 4 时，一个完整批次最多并行 32 条请求。交互式单条请求继续使用单卡入口。
+
+`--weight_cache_mib` 是每卡重用量化权重的显存上限，默认 0。打开后，各层首次使用时缓存前向乘法用到的权重分量，后续 token 和请求可复用。3MM 按原有顺序执行三项乘法。原版 Dense 完整缓存约 469 MiB，MoE 约 1495 MiB，可分别从 512 和 2048 MiB 起步；主权重、KV cache、激活和临时张量另计。
 
 LLM 首先要学会的是先把尽可能多的基础知识和语言规律吸收到参数里。只有这一步打稳了，模型后面才有能力去理解问题、组织表达，并逐步形成像样的生成能力。预训练做的事情，本质上就是让模型先埋头读大量文本，例如 Wiki 百科、新闻、书籍、对话语料等，从中学习事实知识、语言模式以及上下文之间的统计关系。这个阶段通常是“无监督”的：人类不需要逐条告诉模型哪里对、哪里错，而是让它自己从海量文本里总结规律，逐步建立起对世界知识和语言结构的内部表征。
 更直白地说，模型在这一阶段的核心目标就是**学会高质量地词语接龙**。例如输入“秦始皇”，它要能够继续生成“是中国历史上的第一位皇帝”这类符合语义与常识的后续内容。

@@ -23,10 +23,10 @@ def init_model(args):
         ))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = os.path.join(args.save_dir, f'{args.weight}_{args.hidden_size}{moe_suffix}.pth')
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        model.load_state_dict(torch.load(ckp, map_location='cpu'), strict=True)
         if scheme != 'none':
             torch.set_float32_matmul_precision('highest')
-            install_quantization(model.float(), scheme)
+            install_quantization(model.float(), scheme, weight_cache_mib=getattr(args, 'weight_cache_mib', 0))
         if args.lora_weight != 'None':
             apply_lora(model, rank=args.lora_rank)
             load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
@@ -42,6 +42,10 @@ def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
     parser.add_argument('--quant_sim', choices=('none', *SIMULATION_SCHEMES), default='none',
                         help='原生 MiniMind 权重的前向数值模拟格式')
+    parser.add_argument('--weight_cache_mib', type=int, default=0, help='每卡量化权重缓存上限（MiB），0 表示关闭')
+    parser.add_argument('--prompts_jsonl', help='离线贪心生成，每行一个含字符串 prompt 的 JSON 对象')
+    parser.add_argument('--output_jsonl', help='按输入顺序写入离线生成结果')
+    parser.add_argument('--batch_size', type=int, default=4, help='离线生成的每卡提示词数')
     parser.add_argument('--load_from', default='model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
     parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
@@ -59,6 +63,16 @@ def main():
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
+    if args.weight_cache_mib < 0 or (args.weight_cache_mib and args.quant_sim == 'none'):
+        parser.error('--weight_cache_mib requires a simulation scheme and a nonnegative budget')
+    if args.prompts_jsonl or args.output_jsonl:
+        if not (args.prompts_jsonl and args.output_jsonl and args.batch_size > 0 and args.max_new_tokens > 0):
+            parser.error('offline mode requires both JSONL paths and positive --batch_size/--max_new_tokens')
+        from scripts.batch_inference import run_offline
+        run_offline(args, init_model)
+        return
+    if int(os.environ.get('WORLD_SIZE', '1')) > 1:
+        parser.error('use --prompts_jsonl and --output_jsonl when launching multiple inference workers')
     
     prompts = [
         '你有什么特长？',
