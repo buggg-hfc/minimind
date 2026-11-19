@@ -15,6 +15,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
+from model.quant_linear import SIMULATION_SCHEMES, install_quantization
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -56,15 +57,24 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        save_due = step % args.save_interval == 0
+        if args.quant_sim != 'none':
+            # Resume files contain optimizer-boundary state, not pending microbatch gradients.
+            save_due = (step % args.accumulation_steps == 0 and
+                        step // args.save_interval > max(0, step - args.accumulation_steps) // args.save_interval)
+        if (save_due or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            export_dtype = torch.float16 if args.quant_sim == 'none' else torch.float32
+            torch.save({k: v.to(device='cpu', dtype=export_dtype) for k, v in state_dict.items()}, ckp + '.tmp')
+            os.replace(ckp + '.tmp', ckp)
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler,
+                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
+                          quant_sim=args.quant_sim, export_dtype=export_dtype)
             model.train()
             del state_dict
 
@@ -80,6 +90,8 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
+    parser.add_argument('--quant_sim', choices=('none', *SIMULATION_SCHEMES), default='none',
+                        help='V100 数值模拟格式；选中时使用 FP32 承载并关闭原生 AMP')
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
@@ -97,6 +109,10 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
+    simulating = args.quant_sim != 'none'
+    if simulating:
+        args.save_weight = f'{args.save_weight}_{args.quant_sim}'
+        torch.set_float32_matmul_precision('highest')
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
@@ -107,11 +123,13 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    if ckp_data and ckp_data.get('quant_sim', 'none') != args.quant_sim:
+        raise ValueError('Checkpoint quant_sim does not match the requested training format')
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    autocast_ctx = nullcontext() if device_type == "cpu" or simulating else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. 配wandb ==========
     wandb = None
@@ -124,9 +142,12 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    if simulating:
+        install_quantization(model.float(), args.quant_sim)
+        Logger(f'quant_sim={args.quant_sim} | FP32 carrier | AMP off | save_weight={args.save_weight}')
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(not simulating and args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========

@@ -62,7 +62,7 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', export_dtype=torch.float16, **kwargs):
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
@@ -73,7 +73,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         raw_model = getattr(raw_model, '_orig_mod', raw_model)
         state_dict = {k: v.cpu() for k, v in raw_model.state_dict().items()}
         ckp_tmp = ckp_path + '.tmp'
-        torch.save({k: v.half() for k, v in state_dict.items()}, ckp_tmp)
+        torch.save({k: v.to(export_dtype) for k, v in state_dict.items()}, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
         wandb_id = None
         if wandb:

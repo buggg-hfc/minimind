@@ -88,6 +88,13 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1: return x
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
+def _bf16_attention_matmul(lhs, rhs):
+    # FP32 performs the GEMM on V100. The casts also round the gradients in backward.
+    with torch.autocast(device_type=lhs.device.type, enabled=False):
+        lhs = lhs.to(torch.bfloat16).float()
+        rhs = rhs.to(torch.bfloat16).float()
+        return (lhs @ rhs).to(torch.bfloat16).float()
+
 class Attention(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -122,13 +129,16 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+        simulate_bf16 = getattr(self, 'simulate_bf16_attention', False)
+        if not simulate_bf16 and self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
-            scores = (xq @ xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
+            matmul = _bf16_attention_matmul if simulate_bf16 else torch.matmul
+            scores = matmul(xq, xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if attention_mask is not None: scores += (1.0 - attention_mask.to(scores.dtype).unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq)) @ xv
+            probs = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq))
+            output = matmul(probs, xv)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
