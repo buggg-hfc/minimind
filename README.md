@@ -672,6 +672,59 @@ Zero 模型权重保存为 `full_sft_zero_768.pth`（见下文 MiniMind 模型�
 
 ### 1' 预训练 (Pretrain):
 
+#### V100 上的 BF16 与低精度训练模拟
+
+MiniMind-3 Dense 和 MoE 共用 `--quant_sim`。以下命令从仓库根目录进入 `trainer`，使用本地预训练 JSONL，从随机权重开始训练。每台 8 卡机器可独立运行一个格式；单卡可将 `torchrun --standalone --nproc_per_node=8` 替换为 `python`。
+
+```bash
+cd trainer
+torchrun --standalone --nproc_per_node=8 train_pretrain.py \
+  --use_moe 0 --quant_sim hif4_thr_3mm --from_weight none \
+  --data_path ../dataset/pretrain_t2t_mini.jsonl --max_seq_len 512 \
+  --batch_size 2 --accumulation_steps 4 --num_workers 2 --seed 42
+```
+
+将 `--use_moe` 设为 `1` 即可训练原版 4 专家 top-1 MoE。比较格式时固定数据、初始化种子、每卡 batch 和设备数；dW 沿每个 microbatch 内的 token 维分组，专家层只使用分配给该专家的 token。
+
+| `--quant_sim` | 目标线性层的 FWD、dX、dW |
+|---|---|
+| `none`（默认） | 原仓库训练路径，由 `--dtype` 选择 AMP 精度 |
+| `bf16` | 操作数及 GEMM 输出按 BF16 最近偶数舍入，FP32 承载和累加 |
+| `mxfp8` | 单次 MM，E4M3FN 元素，每 32 个元素共用一个 E8M0 scale，选择足以覆盖组内 amax 的最小可用二次幂（对应 MXFP8 train） |
+| `hif4_thr_3mm` | 64 元素三级 scale，8 和 4 元素子组阈值分别为 3.75 和 1.875，幅值采用 half-up 舍入 |
+| `nvfp4_3mm` | E2M1，每 16 个元素一个 UE5M3 group scale，仅反向 dY 使用 FP32 tensor scale |
+| `nvint4_3mm` | 对称 INT4，范围 −7 到 7；与上行共用相同的分组、尺度和补偿规则 |
+
+所有模拟组从相同的 BF16 逻辑输入出发。量化覆盖 Q/K/V/O 和所有 FFN 或专家的 gate/up/down 投影。对每个乘积沿实际归约维重新分组：前向为 `X @ W.T`，dX 为 `dY @ W`，dW 为 `dY.T @ X`。尾组补零，乘前去除 padding。3MM 按 `A0@B0 + A1@B0 + A0@B1` 顺序以 FP32 相加，再统一舍入到 BF16。两侧的残差分量分别由 `Q(A-A0)`、`Q(B-B0)` 得到，独立重算尺度。
+
+NV 两组的 UE5M3 使用 5 位指数、3 位尾数、偏置 15，最小正值为 2⁻¹⁷，最大有限值为 114688，组尺度采用最近偶数舍入。令 `qmax` 为 6（FP4）或 7（INT4）。反向 dY 的 FP32 tensor scale 取 `amax(dY)/(qmax * 114688)`，全零时取 1，正值下限为 FP32 最小正次正规数。每个组将 `amax(group / tensor_scale) / qmax` 舍入到 UE5M3。dY 的主分量、残差各取一次 tensor scale；其余操作数的 tensor scale 固定为 1。
+
+模拟模式关闭原生 AMP 和 GradScaler。注意力 QK/PV、router 线性层和 LM head 使用共同的 BF16 乘法边界；softmax、归一化、残差流、主权重和优化器使用 FP32。该路径用于数值比较，运行时需要支持 Volta `sm_70` 的 PyTorch CUDA 构建。
+
+模拟权重以 FP32 导出，格式名自动追加到 `--save_weight`。例如默认前缀下，MoE 的 HiF4 权重写入 `out/pretrain_hif4_thr_3mm_768_moe.pth`。使用相同训练命令加 `--from_resume 1` 恢复；不同种子的并行作业指定不同 `--save_weight`。从仓库根目录执行下列命令可选择评测前向精度或运行测试。
+
+```bash
+python eval_llm.py --use_moe 1 --weight pretrain_hif4_thr_3mm --quant_sim hif4_thr_3mm
+python -m unittest discover -s tests -p 'test_v100*.py' -v
+```
+
+**单机八卡训练调优。** DDP 每张卡保存一个模型副本，按 rank 分配训练样本。上例每次更新共处理 `8 × 2 × 4 = 64` 条序列。累积的中间微批在本卡计算梯度，更新前进行一次梯度同步。训练日志的 `valid_tokens/s` 是整个作业每秒处理的有效预测 token 数，已排除 padding 和首个无预测目标的位置。日志窗口包含数据加载及期间发生的保存开销。
+
+在同一格式和固定输入长度下，可比较每卡 batch 与累积步数组合 `2×4`、`4×2`、`8×1`。观察稳定阶段若干日志窗口，同时记录单卡峰值显存，选择能留出显存余量且有效 tokens/s 较高的组合。正式精度比较统一每卡 batch，因为改变它会改变 dW 沿 token 维的分组。数据先放本机 SSD，`--num_workers` 按每个进程计，示例在八卡共启动 16 个加载进程。
+
+**八卡离线生成。** 准备 UTF-8 JSONL，每行一个对象，例如 `{"id":1,"prompt":"什么是量化？"}`。在仓库根目录运行：
+
+```bash
+torchrun --standalone --nproc_per_node=8 eval_llm.py \
+  --use_moe 1 --weight pretrain_hif4_thr_3mm --quant_sim hif4_thr_3mm \
+  --prompts_jsonl prompts.jsonl --output_jsonl responses.jsonl \
+  --batch_size 4 --max_new_tokens 128 --weight_cache_mib 2048
+```
+
+每个 rank 用一张卡，离线模式按输入行分片、逐卡合批做贪心解码并使用 KV cache。rank 0 按输入顺序写回原字段及 `response`、`generated_tokens`，结束时打印整机生成 tokens/s。每卡 batch 为 4 时，一个完整批次最多并行 32 条请求。交互式单条请求继续使用单卡入口。
+
+`--weight_cache_mib` 是每卡重用量化权重的显存上限，默认 0。打开后，各层首次使用时缓存前向乘法用到的权重分量，后续 token 和请求可复用。3MM 按原有顺序执行三项乘法。原版 Dense 完整缓存约 469 MiB，MoE 约 1495 MiB，可分别从 512 和 2048 MiB 起步；主权重、KV cache、激活和临时张量另计。
+
 LLM 首先要学会的是先把尽可能多的基础知识和语言规律吸收到参数里。只有这一步打稳了，模型后面才有能力去理解问题、组织表达，并逐步形成像样的生成能力。预训练做的事情，本质上就是让模型先埋头读大量文本，例如 Wiki 百科、新闻、书籍、对话语料等，从中学习事实知识、语言模式以及上下文之间的统计关系。这个阶段通常是“无监督”的：人类不需要逐条告诉模型哪里对、哪里错，而是让它自己从海量文本里总结规律，逐步建立起对世界知识和语言结构的内部表征。
 更直白地说，模型在这一阶段的核心目标就是**学会高质量地词语接龙**。例如输入“秦始皇”，它要能够继续生成“是中国历史上的第一位皇帝”这类符合语义与常识的后续内容。
 

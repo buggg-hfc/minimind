@@ -88,6 +88,13 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1: return x
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
+def _bf16_attention_matmul(lhs, rhs):
+    # FP32 performs the GEMM on V100. The casts also round the gradients in backward.
+    with torch.autocast(device_type=lhs.device.type, enabled=False):
+        lhs = lhs.to(torch.bfloat16).float()
+        rhs = rhs.to(torch.bfloat16).float()
+        return (lhs @ rhs).to(torch.bfloat16).float()
+
 class Attention(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -116,19 +123,22 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin, unsqueeze_dim=-2)
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+        simulate_bf16 = getattr(self, 'simulate_bf16_attention', False)
+        if not simulate_bf16 and self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
-            scores = (xq @ xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
+            matmul = _bf16_attention_matmul if simulate_bf16 else torch.matmul
+            scores = matmul(xq, xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if attention_mask is not None: scores += (1.0 - attention_mask.to(scores.dtype).unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq)) @ xv
+            probs = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq))
+            output = matmul(probs, xv)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
@@ -166,13 +176,13 @@ class MOEFeedForward(nn.Module):
                 topk_weight = top1 - top1.detach() + 1.0 # k=1: 1.0 forward on purpose, gradient via straight-through
         y = torch.zeros_like(x_flat)
         for i, expert in enumerate(self.experts):
-            mask = (topk_idx == i)
-            if mask.any():
-                token_idx = mask.any(dim=-1).nonzero().flatten()
-                weight = topk_weight[mask].view(-1, 1)
+            token_idx, slot_idx = (topk_idx == i).nonzero(as_tuple=True)
+            if token_idx.numel():
+                weight = topk_weight[token_idx, slot_idx].unsqueeze(-1)
                 y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
             elif self.training:
-                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+                # Keep zero gradients for every idle expert on this DDP rank.
+                y[0, 0] += 0 * sum(p.view(-1)[0] for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
             load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
@@ -221,7 +231,13 @@ class MiniMindModel(nn.Module):
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
-        position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
+        offsets = kwargs.get('left_padding_offsets')
+        if offsets is None:
+            positions = slice(start_pos, start_pos + seq_length)
+        else:
+            # Match unpadded RoPE positions for each prompt, including cached decoding.
+            positions = (torch.arange(start_pos, start_pos + seq_length, device=input_ids.device) - offsets).clamp_min_(0)
+        position_embeddings = (self.freqs_cos[positions], self.freqs_sin[positions])
         presents = []
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present = layer(
@@ -264,6 +280,10 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
+        if attention_mask is not None and input_ids.shape[0] > 1:
+            kwargs['left_padding_offsets'] = attention_mask.long().argmax(dim=-1, keepdim=True)
+        # Prefill only needs the last position's vocabulary projection for decoding.
+        kwargs.setdefault("logits_to_keep", 1)
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         if streamer: streamer.put(input_ids.cpu())
         for _ in range(max_new_tokens):
