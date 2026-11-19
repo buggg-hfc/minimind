@@ -695,16 +695,18 @@ torchrun --standalone --nproc_per_node=8 train_pretrain.py \
 | `nvfp4_3mm` | E2M1，每 16 个元素一个 UE5M3 group scale，仅反向 dY 使用 FP32 tensor scale |
 | `nvint4_3mm` | 对称 INT4，范围 −7 到 7；与上行共用相同的分组、尺度和补偿规则 |
 
-所有模拟组从相同的 BF16 逻辑输入出发。量化覆盖 Q/K/V/O 和所有 FFN 或专家的 gate/up/down 投影。对每个乘积沿实际归约维重新分组：前向为 `X @ W.T`，dX 为 `dY @ W`，dW 为 `dY.T @ X`。尾组补零，乘前去除 padding。3MM 按 `A0@B0 + A1@B0 + A0@B1` 顺序以 FP32 相加，再统一舍入到 BF16。两侧的残差分量分别由 `Q(A-A0)`、`Q(B-B0)` 得到，独立重算尺度。
+所有模拟组从相同的 BF16 逻辑输入出发。量化覆盖 Q/K/V/O 和所有 FFN 或专家的 gate/up/down 投影。对每个乘积沿实际归约维重新分组：前向为 `X @ W.T`，dX 为 `dY @ W`，dW 为 `dY.T @ X`。尾组补零，乘前去除 padding。3MM 按 `A0@B0 + A1@B0 + A0@B1` 顺序以 FP32 相加，再统一舍入到 BF16。两侧都将原操作数和主路径反量化值先转为 BF16，在 BF16 域求差（结果也是 BF16），再转回 FP32 承载去量化残差。残差重新拟合自己的 group scale 或 HiF4 的块/微缩放。预计算的推理权重残差采用同样的规则。
 
-NV 两组的 UE5M3 使用 5 位指数、3 位尾数、偏置 15，最小正值为 2⁻¹⁷，最大有限值为 114688，组尺度采用最近偶数舍入。令 `qmax` 为 6（FP4）或 7（INT4）。反向 dY 的 FP32 tensor scale 取 `amax(dY)/(qmax * 114688)`，全零时取 1，正值下限为 FP32 最小正次正规数。每个组将 `amax(group / tensor_scale) / qmax` 舍入到 UE5M3。dY 的主分量、残差各取一次 tensor scale；其余操作数的 tensor scale 固定为 1。
+NV 两组的 UE5M3 使用 5 位指数、3 位尾数、偏置 15，最小正值为 2⁻¹⁷，最大有限值为 114688，组尺度采用最近偶数舍入。令 `qmax` 为 6（FP4）或 7（INT4）。反向 dY 的 FP32 tensor scale 取 `amax(dY)/(qmax * 114688)`，全零时取 1，正值下限为 FP32 最小正次正规数。每个组将 `amax(group / tensor_scale) / qmax` 舍入到 UE5M3。同一次乘法中，dY 主分量与其残差共享这个 FP32 tensor scale。UE5M3 group scale 仍按各自分量分别拟合。其余操作数均无 tensor scale，等价于 1。
+
+使用新规则的三个 3MM 训练输出带 `_r2` 后缀，续训元数据和实验报告记录 `residual_policy=bf16_diff_shared_tensor_scale_v2`。重跑时可从仓库根目录执行 `python scripts/minimind_v100_pilot.py train nvfp4_3mm`，然后以 `eval nvfp4_3mm` 和 `eval nvfp4_3mm --eval-scheme same` 分别评估。各条命令加 `--moe` 即可切换到 MoE。
 
 模拟模式关闭原生 AMP 和 GradScaler。注意力 QK/PV、router 线性层和 LM head 使用共同的 BF16 乘法边界；softmax、归一化、残差流、主权重和优化器使用 FP32。该路径用于数值比较，运行时需要支持 Volta `sm_70` 的 PyTorch CUDA 构建。
 
-模拟权重以 FP32 导出，格式名自动追加到 `--save_weight`。例如默认前缀下，MoE 的 HiF4 权重写入 `out/pretrain_hif4_thr_3mm_768_moe.pth`。使用相同训练命令加 `--from_resume 1` 恢复；不同种子的并行作业指定不同 `--save_weight`。从仓库根目录执行下列命令可选择评测前向精度或运行测试。
+模拟权重以 FP32 导出，格式名自动追加到 `--save_weight`。例如默认前缀下，MoE 的 HiF4 权重写入 `out/pretrain_hif4_thr_3mm_r2_768_moe.pth`。使用相同训练命令加 `--from_resume 1` 恢复；不同种子的并行作业指定不同 `--save_weight`。从仓库根目录执行下列命令可选择评测前向精度或运行测试。
 
 ```bash
-python eval_llm.py --use_moe 1 --weight pretrain_hif4_thr_3mm --quant_sim hif4_thr_3mm
+python eval_llm.py --use_moe 1 --weight pretrain_hif4_thr_3mm_r2 --quant_sim hif4_thr_3mm
 python -m unittest discover -s tests -p 'test_v100*.py' -v
 ```
 
@@ -716,7 +718,7 @@ python -m unittest discover -s tests -p 'test_v100*.py' -v
 
 ```bash
 torchrun --standalone --nproc_per_node=8 eval_llm.py \
-  --use_moe 1 --weight pretrain_hif4_thr_3mm --quant_sim hif4_thr_3mm \
+  --use_moe 1 --weight pretrain_hif4_thr_3mm_r2 --quant_sim hif4_thr_3mm \
   --prompts_jsonl prompts.jsonl --output_jsonl responses.jsonl \
   --batch_size 4 --max_new_tokens 128 --weight_cache_mib 2048
 ```
