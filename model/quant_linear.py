@@ -123,9 +123,9 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
 
     Native MiniMind-3 stores each MoE expert as a separate MLP. Its unselected
     experts, router, and shared embedding/head retain their original identities.
-    In mixed MoE schemes Q/K/V/O use the selected 4-bit format and every expert's
-    gate/up/down projections use MXFP8 for forward, dX, and dW. All simulated
-    schemes use BF16 for the router and output head.
+    In mixed MoE schemes the selected gate/up/down projections in every expert use
+    MXFP8 for forward, dX, and dW. The other expert projections and Q/K/V/O use
+    the base 4-bit format. All simulated schemes use BF16 for the router and head.
     A positive inference cache budget reserves slots in module order, filled on first
     use under eval/no-grad. The budget covers persistent reconstructed weights, not
     transient GEMM/quantization workspaces. Reinstalling clears all old entries.
@@ -161,7 +161,8 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
         if not hasattr(module, "_simulation_scheme"):
             module._original_instance_forward = module.__dict__.get("forward")
             module.forward = MethodType(_simulated_forward, module)
-        module._simulation_scheme = policy[_PROJECTION_ROLES[leaf]]
+        layer_scheme = policy[_PROJECTION_ROLES[leaf]]
+        module._simulation_scheme = layer_scheme[leaf] if isinstance(layer_scheme, dict) else layer_scheme
         size = _weight_cache_bytes(module.weight, module._simulation_scheme)
         module._cache_capacity = size if size <= remaining else 0
         remaining -= module._cache_capacity

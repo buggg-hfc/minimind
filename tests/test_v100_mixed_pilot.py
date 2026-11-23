@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 import torch
 
-from model.quant_policy import MIXED_SCHEMES, RESIDUAL_POLICY, projection_policy, scheme_artifact_name
+from model.quant_policy import FOUR_BIT_SCHEMES, MIXED_SCHEMES, RESIDUAL_POLICY, projection_policy, scheme_artifact_name
 from scripts import minimind_v100_pilot as pilot
 
 
@@ -39,7 +40,8 @@ class MixedPilotTest(unittest.TestCase):
                     "world_size": 8, "step": step}, state)
 
     def test_suite_resumes_partial_and_starts_missing_after_skipping_complete(self):
-        done, partial, fresh = MIXED_SCHEMES
+        legacy_cases = [base + "_ffn_mxfp8" for base in FOUR_BIT_SCHEMES]
+        done, partial, fresh = legacy_cases
         seed = 43
         self.save_progress(done, seed, 2)
         self.save_progress(partial, seed, 1)
@@ -64,11 +66,40 @@ class MixedPilotTest(unittest.TestCase):
                 self.assertIn("--nproc-per-node=8", cmd)
             eval_commands = [call.args[0] for call in evaluate.call_args_list]
             self.assertEqual([(c[c.index("eval") + 1], c[c.index("--eval-scheme") + 1]) for c in eval_commands],
-                             [(scheme, mode) for scheme in MIXED_SCHEMES for mode in ("bf16", "same")])
+                             [(scheme, mode) for scheme in legacy_cases for mode in ("bf16", "same")])
             for cmd in eval_commands:
                 self.assertEqual(cmd[cmd.index("--seed") + 1], "43")
                 self.assertIn("--moe", cmd)
                 self.assertIn("--reuse", cmd)
+
+    def test_grid_schedules_each_case_once_and_each_case_gets_both_evals(self):
+        groups = ("up", "gate", "down", "up_gate", "up_down", "gate_down", "all")
+        cases = [f"{base}_ffn_mxfp8" if group == "all" else f"{base}_ffn_{group}_mxfp8"
+                 for group in groups for base in FOUR_BIT_SCHEMES]
+        with patch.object(pilot, "train") as train, patch.object(pilot.subprocess, "run") as evaluate:
+            pilot.moe_ffn_mxfp8(self.root, 42, resume=True, groups=["grid"])
+        self.assertEqual([call.args[2] for call in train.call_args_list], cases)
+        self.assertEqual(len(set(cases)), 21)
+        self.assertTrue(all(c.kwargs == {"seed": 42, "resume_if_present": True} for c in train.call_args_list))
+        commands = [c.args[0] for c in evaluate.call_args_list]
+        self.assertEqual([(cmd[cmd.index("eval") + 1], cmd[cmd.index("--eval-scheme") + 1]) for cmd in commands],
+                         [(scheme, mode) for scheme in cases for mode in ("bf16", "same")])
+
+    def test_cli_can_run_selected_groups_for_one_format(self):
+        for name in ("model/quant_policy.py", "tests/test_v100_batch_inference.py"):
+            marker = self.root / name
+            marker.parent.mkdir()
+            marker.touch()
+        argv = ["pilot", "--root", str(self.root), "moe-ffn-mxfp8", "--groups", "up,down", "up_down", "up",
+                "--formats", "nvint4_3mm", "--resume"]
+        with patch.object(sys, "argv", argv), patch.object(sys, "path", sys.path.copy()), \
+                patch.object(pilot, "train") as train, patch.object(pilot.subprocess, "run"):
+            pilot.main()
+        self.assertEqual([c.args[2] for c in train.call_args_list],
+                         [f"nvint4_3mm_ffn_{group}_mxfp8" for group in ("up", "down", "up_down")])
+        with patch.object(pilot, "train") as train, self.assertRaisesRegex(SystemExit, "bad_group"):
+            pilot.moe_ffn_mxfp8(self.root, 42, resume=True, groups=["up", "bad_group"])
+        train.assert_not_called()
 
     def test_rejects_dense_or_orphaned_mixed_run_and_wrong_seed(self):
         mixed = next(iter(MIXED_SCHEMES))

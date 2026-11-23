@@ -4,7 +4,8 @@
 Typical commands: check, smoke, prepare, train mxfp8, eval mxfp8.
 Append --moe to train/eval for MoE. Use eval --eval-scheme same to also
 measure the training format in the evaluation forward pass. moe-ffn-mxfp8
-trains and evaluates the three MoE attention-4bit / expert-FFN-MXFP8 cases.
+uses MXFP8 on all three expert projections by default. Add --groups grid
+to compare the seven nonempty subsets across the three 4-bit attention formats.
 """
 import argparse
 import hashlib
@@ -313,12 +314,23 @@ def train(root, moe, scheme, smoke=False, resume=False, *, seed=42, resume_if_pr
     print(f"PASS {arch} {scheme} | {weights} | {log_path}", flush=True)
 
 
-def moe_ffn_mxfp8(root, seed, resume):
-    from model.quant_policy import MIXED_SCHEMES
+def moe_ffn_mxfp8(root, seed, resume, *, groups=("all",), formats=None):
+    from model.quant_policy import FFN_MXFP8_GROUPS, FOUR_BIT_SCHEMES, ffn_mxfp8_scheme
 
+    requested = {group.strip() for arg in groups for group in arg.split(",")}
+    unknown = requested.difference(FFN_MXFP8_GROUPS, ("grid",))
+    if unknown:
+        raise SystemExit(f"Unknown --groups: {', '.join(sorted(unknown))}. Choose from {', '.join(FFN_MXFP8_GROUPS)} or grid.")
+    groups = [group for group in FFN_MXFP8_GROUPS if "grid" in requested or group in requested]
+    formats = FOUR_BIT_SCHEMES if formats is None else tuple(dict.fromkeys(formats))
+    unknown = set(formats).difference(FOUR_BIT_SCHEMES)
+    if unknown:
+        raise SystemExit(f"Unknown --formats: {', '.join(sorted(unknown))}. Choose from {', '.join(FOUR_BIT_SCHEMES)}.")
+    schemes = [ffn_mxfp8_scheme(base, group) for group in groups for base in formats]
     if not (root / "runs/v100-pilot/data/valid.jsonl").is_file():
         raise SystemExit("Missing valid.jsonl. Prepare the fixed pilot split before training.")
-    for scheme in MIXED_SCHEMES:
+    for index, scheme in enumerate(schemes, 1):
+        print(f"[{index}/{len(schemes)}] {scheme} | seed={seed}", flush=True)
         train(root, True, scheme, seed=seed, resume_if_present=resume)
         for forward in ("bf16", "same"):
             # Let the evaluator release its CUDA context before the next eight-rank job.
@@ -360,7 +372,12 @@ def main():
     for p in (train_args, eval_args):
         p.add_argument("scheme", help="Training scheme (bf16, mxfp8, a 3MM format, or a mixed MoE scheme)")
         p.add_argument("--moe", action="store_true", help="Use MiniMind-3-MoE; default Dense")
-    ablation = commands.add_parser("moe-ffn-mxfp8", help="Run all three MoE 4-bit attention / MXFP8 expert pilots")
+    ablation = commands.add_parser("moe-ffn-mxfp8", help="Compare MXFP8 subsets of the three expert projections")
+    ablation.add_argument("--groups", nargs="+", default=("all",), metavar="GROUP",
+                          help="up, gate, down, up_gate, up_down, gate_down, all (default: all three projections). "
+                               "Use grid for all seven subsets. Accepts spaces or commas.")
+    ablation.add_argument("--formats", nargs="+", metavar="FORMAT",
+                          help="4-bit base formats to train (default: hif4_thr_3mm nvfp4_3mm nvint4_3mm)")
     ablation.add_argument("--resume", action="store_true", help="Continue the suite, including previously unstarted cases")
     for p in (train_args, eval_args, ablation):
         p.add_argument("--seed", type=int, default=42, help="Training seed (default 42 for paired historical comparisons)")
@@ -383,7 +400,7 @@ def main():
     elif args.command == "prepare":
         prepare(root)
     elif args.command == "moe-ffn-mxfp8":
-        moe_ffn_mxfp8(root, args.seed, args.resume)
+        moe_ffn_mxfp8(root, args.seed, args.resume, groups=args.groups, formats=args.formats)
     elif args.command == "train":
         train(root, args.moe, args.scheme, resume=args.resume, seed=args.seed)
     else:
