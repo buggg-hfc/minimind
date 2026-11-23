@@ -3,7 +3,8 @@
 
 Typical commands: check, smoke, prepare, train mxfp8, eval mxfp8.
 Append --moe to train/eval for MoE. Use eval --eval-scheme same to also
-measure the training format in the evaluation forward pass.
+measure the training format in the evaluation forward pass. moe-ffn-mxfp8
+trains and evaluates the three MoE attention-4bit / expert-FFN-MXFP8 cases.
 """
 import argparse
 import hashlib
@@ -89,18 +90,26 @@ def prepare(root: Path):
             print(f"{target} rows={len(selected)} sha256={split_hash.hexdigest()}", flush=True)
 
 
-def evaluate(root, moe, scheme, eval_scheme, device="cuda:0"):
-    """Score a pilot checkpoint on the reserved documents with token-weighted NLL."""
-    import torch
-    from torch.utils.data import DataLoader
-    from transformers import AutoTokenizer
-    from dataset.lm_dataset import PretrainDataset
-    from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
-    from model.quant_linear import SIMULATION_SCHEMES, install_quantization
-    from model.quant_policy import RESIDUAL_POLICY, RESIDUAL_SCHEMES, scheme_artifact_name
+def validate_case(moe, scheme, seed):
+    from model.quant_policy import MIXED_SCHEMES, MODEL_SCHEMES
 
-    if scheme not in SIMULATION_SCHEMES or eval_scheme not in ("same", "bf16"):
-        raise ValueError("Expected a training simulation format and an evaluation format of bf16 or same.")
+    if scheme not in MODEL_SCHEMES:
+        raise ValueError(f"Unknown format {scheme!r}. Choose one of: {', '.join(MODEL_SCHEMES)}")
+    if scheme in MIXED_SCHEMES and not moe:
+        raise ValueError(f"{scheme} requires --moe")
+    if not 0 <= seed <= 2**32 - 8:
+        raise ValueError("--seed must leave room for all eight seed+rank values in uint32")
+
+
+def evaluate(root, moe, scheme, eval_scheme, device="cuda:0", *, seed=42, reuse=False):
+    """Score a pilot checkpoint on the reserved documents with token-weighted NLL."""
+    validate_case(moe, scheme, seed)
+    from model.quant_policy import (
+        MIXED_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES, projection_policy, scheme_artifact_name,
+    )
+
+    if eval_scheme not in ("same", "bf16"):
+        raise ValueError("Expected an evaluation format of bf16 or same.")
     forward_scheme = scheme if eval_scheme == "same" else "bf16"
     root = Path(root)
     pilot = root / "runs" / "v100-pilot"
@@ -108,9 +117,42 @@ def evaluate(root, moe, scheme, eval_scheme, device="cuda:0"):
     architecture = "moe" if moe else "dense"
     suffix = "_moe" if moe else ""
     scheme_name = scheme_artifact_name(scheme)
-    weights = root / "out" / f"pilot32k_s42_{scheme_name}_768{suffix}.pth"
+    weights = root / "out" / f"pilot32k_s{seed}_{scheme_name}_768{suffix}.pth"
     if not valid.is_file() or not weights.is_file():
         raise FileNotFoundError(valid if not valid.is_file() else weights)
+    directory = pilot / "results"
+    if seed != 42:
+        directory = directory / f"seed{seed}"
+    dest = directory / f"{architecture}__{scheme_name}__eval_{forward_scheme}.json"
+    identity = {
+        "architecture": architecture, "seed": seed, "train_scheme": scheme, "eval_scheme": forward_scheme,
+        "checkpoint": weights.name, "valid_sha256": hashlib.sha256(valid.read_bytes()).hexdigest(),
+        "seq_len": 512, "batch_size": 2,
+    }
+    if scheme in MIXED_SCHEMES:
+        identity["train_projection_policy"] = projection_policy(scheme)
+        identity["eval_projection_policy"] = projection_policy(forward_scheme)
+    if scheme in RESIDUAL_SCHEMES:
+        identity["residual_policy"] = RESIDUAL_POLICY
+    if forward_scheme in RESIDUAL_SCHEMES:
+        identity["eval_residual_policy"] = RESIDUAL_POLICY
+    if reuse and dest.is_file() and dest.stat().st_mtime_ns > weights.stat().st_mtime_ns:
+        try:
+            previous = json.loads(dest.read_text(encoding="utf-8"))
+            if (isinstance(previous, dict) and all(previous.get(k) == v for k, v in identity.items())
+                    and previous["valid_tokens"] > 0 and math.isfinite(previous["mean_ce"])
+                    and math.isfinite(previous["ppl"])):
+                print(f"Reusing completed evaluation: {dest}", flush=True)
+                return previous
+        except (ValueError, KeyError, TypeError):
+            pass
+
+    import torch
+    from torch.utils.data import DataLoader
+    from transformers import AutoTokenizer
+    from dataset.lm_dataset import PretrainDataset
+    from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+    from model.quant_linear import install_quantization
 
     torch.set_float32_matmul_precision("highest")
     device = torch.device(device)
@@ -139,19 +181,8 @@ def evaluate(root, moe, scheme, eval_scheme, device="cuda:0"):
     mean_ce = nll_sum.item() / token_count
     if not math.isfinite(mean_ce):
         raise ValueError(f"Nonfinite validation CE: {mean_ce}")
-    result = {
-        "architecture": architecture, "train_scheme": scheme, "eval_scheme": forward_scheme,
-        "checkpoint": weights.name, "valid_sha256": hashlib.sha256(valid.read_bytes()).hexdigest(),
-        "documents": len(documents), "valid_tokens": token_count, "seq_len": 512, "batch_size": 2,
-        "mean_ce": mean_ce, "ppl": math.exp(mean_ce),
-    }
-    if scheme in RESIDUAL_SCHEMES:
-        result["residual_policy"] = RESIDUAL_POLICY
-    if forward_scheme in RESIDUAL_SCHEMES:
-        result["eval_residual_policy"] = RESIDUAL_POLICY
-    directory = pilot / "results"
+    result = dict(identity, documents=len(documents), valid_tokens=token_count, mean_ce=mean_ce, ppl=math.exp(mean_ce))
     directory.mkdir(parents=True, exist_ok=True)
-    dest = directory / f"{architecture}__{scheme_name}__eval_{forward_scheme}.json"
     payload = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
     tmp = tempfile.NamedTemporaryFile("w", dir=directory, encoding="utf-8", delete=False)
     try:
@@ -162,9 +193,6 @@ def evaluate(root, moe, scheme, eval_scheme, device="cuda:0"):
         Path(tmp.name).unlink(missing_ok=True)
     print(payload)
     return result
-
-
-FORMATS = ("bf16", "mxfp8", "hif4_thr_3mm", "nvfp4_3mm", "nvint4_3mm")
 
 
 def local_torchrun(script, *args):
@@ -208,10 +236,11 @@ def check(root):
                    cwd=root, check=True)
 
 
-def train(root, moe, scheme, smoke=False, resume=False):
-    from model.quant_policy import scheme_artifact_name
+def train(root, moe, scheme, smoke=False, resume=False, *, seed=42, resume_if_present=False):
+    from model.quant_policy import scheme_artifact_name, validate_resume_policy
 
-    label = "smoke_v100" if smoke else "pilot32k_s42"
+    validate_case(moe, scheme, seed)
+    label = "smoke_v100" if smoke else f"pilot32k_s{seed}"
     arch = "moe" if moe else "dense"
     run_dir = root / "runs" / "v100-pilot"
     data_path = run_dir / "data" / ("smoke.jsonl" if smoke else "train.jsonl")
@@ -223,9 +252,30 @@ def train(root, moe, scheme, smoke=False, resume=False):
     state = root / "checkpoints" / (basename + "_resume.pth")
     if not data_path.is_file():
         raise SystemExit(f"Missing {data_path}. Run prepare first.")
+    if resume_if_present:
+        resume = state.is_file()
+        if not resume and weights.exists():
+            raise SystemExit(f"Found {weights} without {state}. Restore the matching resume checkpoint, or move "
+                             "the orphaned export to a backup path before restarting this scheme from scratch.")
+        if resume:
+            import torch
+
+            # Read the committed cursor without allocating all the optimizer tensors.
+            checkpoint = torch.load(state, map_location="cpu", weights_only=True, mmap=True)
+            validate_resume_policy(checkpoint, scheme, seed=seed)
+            with data_path.open("rb") as rows:
+                final_step = math.ceil(sum(bool(line.strip()) for line in rows) / (8 * 2))
+            if checkpoint["world_size"] != 8 or checkpoint["epoch"] != 0 or not 0 < checkpoint["step"] <= final_step:
+                raise ValueError(f"Unexpected 32k pilot progress in {state}")
+            if checkpoint["step"] == final_step:
+                if not weights.is_file():
+                    raise FileNotFoundError(weights)
+                print(f"Training already complete: {weights}", flush=True)
+                return
+            del checkpoint
     if resume and not state.is_file():
         raise SystemExit(f"Missing resume checkpoint {state}")
-    if not smoke and not resume and (state.exists() or weights.exists()):
+    if not smoke and not resume and not resume_if_present and (state.exists() or weights.exists()):
         raise SystemExit(f"{basename} already exists. Use eval for completed runs, or train --resume for an interrupted run.")
     cmd = local_torchrun(root / "trainer" / "train_pretrain.py",
                          "--from_weight", "none", "--from_resume", int(resume),
@@ -233,7 +283,7 @@ def train(root, moe, scheme, smoke=False, resume=False):
                          "--hidden_size", hidden, "--num_hidden_layers", 2 if smoke else 8,
                          "--max_seq_len", 64 if smoke else 512, "--epochs", 1, "--batch_size", 2,
                          "--accumulation_steps", 2 if smoke else 4, "--learning_rate", 5e-4,
-                         "--num_workers", 0 if smoke else 2, "--seed", 42,
+                         "--num_workers", 0 if smoke else 2, "--seed", seed,
                          "--log_interval", 1 if smoke else 20, "--save_interval", 4 if smoke else 256,
                          "--data_path", data_path)
     logs = run_dir / "logs"
@@ -261,6 +311,22 @@ def train(root, moe, scheme, smoke=False, resume=False):
     if (last_loss is None and not resume) or (last_loss is not None and not math.isfinite(last_loss)):
         raise RuntimeError(f"Missing or nonfinite final training loss: {last_loss}. Log: {log_path}")
     print(f"PASS {arch} {scheme} | {weights} | {log_path}", flush=True)
+
+
+def moe_ffn_mxfp8(root, seed, resume):
+    from model.quant_policy import MIXED_SCHEMES
+
+    if not (root / "runs/v100-pilot/data/valid.jsonl").is_file():
+        raise SystemExit("Missing valid.jsonl. Prepare the fixed pilot split before training.")
+    for scheme in MIXED_SCHEMES:
+        train(root, True, scheme, seed=seed, resume_if_present=resume)
+        for forward in ("bf16", "same"):
+            # Let the evaluator release its CUDA context before the next eight-rank job.
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--root", str(root), "eval", scheme,
+                   "--moe", "--seed", str(seed), "--eval-scheme", forward]
+            if resume:
+                cmd.append("--reuse")
+            subprocess.run(cmd, cwd=root, check=True)
 
 
 def smoke_test(root):
@@ -292,11 +358,16 @@ def main():
     train_args = commands.add_parser("train", help="Pretrain from scratch on the fixed 32k subset, one eight-GPU job")
     eval_args = commands.add_parser("eval", help="Evaluate one pilot checkpoint on the held-out dataset")
     for p in (train_args, eval_args):
-        p.add_argument("scheme", choices=FORMATS, help="Training scheme of the checkpoint")
+        p.add_argument("scheme", help="Training scheme (bf16, mxfp8, a 3MM format, or a mixed MoE scheme)")
         p.add_argument("--moe", action="store_true", help="Use MiniMind-3-MoE; default Dense")
+    ablation = commands.add_parser("moe-ffn-mxfp8", help="Run all three MoE 4-bit attention / MXFP8 expert pilots")
+    ablation.add_argument("--resume", action="store_true", help="Continue the suite, including previously unstarted cases")
+    for p in (train_args, eval_args, ablation):
+        p.add_argument("--seed", type=int, default=42, help="Training seed (default 42 for paired historical comparisons)")
     train_args.add_argument("--resume", action="store_true", help="Continue from an existing pilot optimizer checkpoint")
     eval_args.add_argument("--eval-scheme", choices=("bf16", "same"), default="bf16")
     eval_args.add_argument("--device", default="cuda:0")
+    eval_args.add_argument("--reuse", action="store_true", help="Reuse a matching evaluation newer than the weights")
     commands.add_parser("_rank_check", help="Internal NCCL worker launched by check")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -311,10 +382,12 @@ def main():
         smoke_test(root)
     elif args.command == "prepare":
         prepare(root)
+    elif args.command == "moe-ffn-mxfp8":
+        moe_ffn_mxfp8(root, args.seed, args.resume)
     elif args.command == "train":
-        train(root, args.moe, args.scheme, resume=args.resume)
+        train(root, args.moe, args.scheme, resume=args.resume, seed=args.seed)
     else:
-        evaluate(root, args.moe, args.scheme, args.eval_scheme, args.device)
+        evaluate(root, args.moe, args.scheme, args.eval_scheme, args.device, seed=args.seed, reuse=args.reuse)
 
 
 if __name__ == "__main__":

@@ -8,12 +8,14 @@ from torch import nn
 from torch.autograd.function import once_differentiable
 
 from .quant_formats import bf16_residual, compute_nv_tensor_scale, quantize
+from .quant_policy import MIXED_SCHEMES, SIMULATION_SCHEMES, projection_policy
 
-SIMULATION_SCHEMES = (
-    "bf16", "mxfp8", "hif4_thr_3mm", "nvfp4_3mm", "nvint4_3mm",
-)
 _NV_SCHEMES = {"nvfp4_3mm", "nvint4_3mm"}
-_PROJECTIONS = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+_PROJECTION_ROLES = {
+    "q_proj": "attention", "k_proj": "attention", "v_proj": "attention", "o_proj": "attention",
+    "gate_proj": "ffn", "up_proj": "ffn", "down_proj": "ffn",
+    "gate": "router", "lm_head": "lm_head",
+}
 
 
 def _bf16_value(x):
@@ -121,14 +123,17 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
 
     Native MiniMind-3 stores each MoE expert as a separate MLP. Its unselected
     experts, router, and shared embedding/head retain their original identities.
-    The router and output head use the same BF16 linear policy in all five modes.
+    In mixed MoE schemes Q/K/V/O use the selected 4-bit format and every expert's
+    gate/up/down projections use MXFP8 for forward, dX, and dW. All simulated
+    schemes use BF16 for the router and output head.
     A positive inference cache budget reserves slots in module order, filled on first
     use under eval/no-grad. The budget covers persistent reconstructed weights, not
     transient GEMM/quantization workspaces. Reinstalling clears all old entries.
     Passing 'none' restores the original forward methods.
     """
-    if scheme != "none" and scheme not in SIMULATION_SCHEMES:
-        raise ValueError(f"Unknown simulation scheme: {scheme!r}")
+    policy = projection_policy(scheme)
+    if scheme in MIXED_SCHEMES and not getattr(getattr(model, "config", None), "use_moe", False):
+        raise ValueError(f"{scheme} requires a MiniMind MoE model (use_moe=True)")
     if not isinstance(weight_cache_mib, int) or weight_cache_mib < 0:
         raise ValueError("weight_cache_mib must be a non-negative integer")
     if scheme == "none" and weight_cache_mib:
@@ -141,7 +146,7 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
             continue
         if not isinstance(module, nn.Linear):
             continue
-        if leaf not in _PROJECTIONS and leaf not in {"gate", "lm_head"}:
+        if leaf not in _PROJECTION_ROLES:
             continue
         if scheme == "none":
             if hasattr(module, "_simulation_scheme"):
@@ -156,7 +161,7 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
         if not hasattr(module, "_simulation_scheme"):
             module._original_instance_forward = module.__dict__.get("forward")
             module.forward = MethodType(_simulated_forward, module)
-        module._simulation_scheme = scheme if leaf in _PROJECTIONS else "bf16"
+        module._simulation_scheme = policy[_PROJECTION_ROLES[leaf]]
         size = _weight_cache_bytes(module.weight, module._simulation_scheme)
         module._cache_capacity = size if size <= remaining else 0
         remaining -= module._cache_capacity

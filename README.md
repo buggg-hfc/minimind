@@ -701,6 +701,26 @@ NV 两组的 UE5M3 使用 5 位指数、3 位尾数、偏置 15，最小正值�
 
 使用新规则的三个 3MM 训练输出带 `_r2` 后缀，续训元数据和实验报告记录 `residual_policy=bf16_diff_shared_tensor_scale_v2`。重跑时可从仓库根目录执行 `python scripts/minimind_v100_pilot.py train nvfp4_3mm`，然后以 `eval nvfp4_3mm` 和 `eval nvfp4_3mm --eval-scheme same` 分别评估。各条命令加 `--moe` 即可切换到 MoE。
 
+**MiniMind-3-MoE 专家 FFN 回退实验**
+
+| 训练方案 | 注意力 Q/K/V/O 投影 | 每个专家的 gate/up/down 投影 |
+|---|---|---|
+| `hif4_thr_3mm_ffn_mxfp8` | HiF4-thr 3MM | MXFP8 |
+| `nvfp4_3mm_ffn_mxfp8` | NVFP4 3MM | MXFP8 |
+| `nvint4_3mm_ffn_mxfp8` | NVINT4 3MM | MXFP8 |
+
+表中格式同时用于前向、输入梯度 dX 和权重梯度 dW。专家内部的 `gate_proj` 随 FFN 切换到 MXFP8。负责选择专家的 `mlp.gate`、注意力分数和上下文乘法（QK、PV）、输出头均沿用 BF16 模拟。三组沿用同一版 R2 残差规则。
+
+在仓库根目录，用原 32k pilot 的 `runs/v100-pilot/data/train.jsonl` 和 `valid.jsonl` 运行：
+
+```bash
+python scripts/minimind_v100_pilot.py moe-ffn-mxfp8 --seed 42 --resume
+```
+
+命令在本机八张卡上依次运行三组。首次运行从随机初始化开始，再次运行时从各自断点继续，并补齐验证结果。每组分别用统一 BF16 前向和训练时的混合前向验证。默认 seed 42、每卡 batch 2、累积 4 个微批、序列长度 512、训练 1 轮，和原 MoE pilot 对齐。权重、断点和日志使用独立的 `_ffn_mxfp8_r2` 标记。seed 42 的验证 JSON 保存在 `runs/v100-pilot/results/`，其他种子保存在其 `seed<N>/` 子目录。
+
+评估三个专家投影的整体影响时，使用同一验证集、同一种子下的 BF16 前向 `mean_ce`。逐格式计算「混合组 CE − 原同格式全 4-bit R2 组 CE」，负值表示回退后三个投影合计带来了改善。再用「混合组 CE − 原全 MXFP8 组 CE」衡量与 MXFP8 的差距。
+
 模拟模式关闭原生 AMP 和 GradScaler。注意力 QK/PV、router 线性层和 LM head 使用共同的 BF16 乘法边界；softmax、归一化、残差流、主权重和优化器使用 FP32。该路径用于数值比较，运行时需要支持 Volta `sm_70` 的 PyTorch CUDA 构建。
 
 模拟权重以 FP32 导出，格式名自动追加到 `--save_weight`。例如默认前缀下，MoE 的 HiF4 权重写入 `out/pretrain_hif4_thr_3mm_r2_768_moe.pth`。使用相同训练命令加 `--from_resume 1` 恢复；不同种子的并行作业指定不同 `--save_weight`。从仓库根目录执行下列命令可选择评测前向精度或运行测试。
