@@ -128,12 +128,12 @@ def load_runs(root, train, valid, logs):
                 validation(valid, case, int(row["optimizer_update"]), row["mean_ce"], row["valid_tokens"], path)
             sources.append(path)
     for name, path in prefixes.items():
-        if path.is_file():
+        if logs is not None and path.is_file():
             points = read_prefix(path)
             if points:
                 logs[name] = points
                 sources.append(path)
-    if not sources:
+    if not sources and logs is not None:
         raise ValueError(f"No seed-42 fork measurements found in {root}")
     print(f"Loaded {len(sources)} local result files from {root}")
 

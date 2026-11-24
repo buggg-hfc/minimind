@@ -19,7 +19,7 @@ RESUME = re.compile(r"跳过前\s*(\d+)\s*个step")
 FIELDS = ("loss", "logits_loss", "aux_loss", "lr")
 
 
-def read_log(path):
+def read_log(path, *, last_microbatch=PREFIX_END, allow_empty=False):
     records = {}
     removed = 0
     with path.open(encoding="utf-8", errors="replace") as f:
@@ -36,16 +36,16 @@ def read_log(path):
             if not match:
                 continue
             step = int(match[1])
-            if not 1 <= step <= PREFIX_END or step % 4:
-                raise ValueError(f"{path}: 意外的前缀 microbatch {step}")
+            if not 1 <= step <= last_microbatch or step % 4:
+                raise ValueError(f"{path}: 意外的 microbatch {step}")
             values = dict(zip(FIELDS, map(float, match.groups()[1:])))
             if not math.isfinite(values["lr"]) or values["lr"] <= 0:
                 raise ValueError(f"{path}: microbatch {step} 学习率无效")
             if step in records and records[step] != values:
                 raise ValueError(f"{path}: microbatch {step} 有冲突记录且缺少回退游标")
             records[step] = values
-    if not records:
-        raise ValueError(f"未找到前缀训练记录：{path}")
+    if not records and not allow_empty:
+        raise ValueError(f"未找到训练记录：{path}")
     if removed:
         print(f"{path.name} ({path.parent.name})：忽略 {removed} 条被后续重启覆盖的记录。")
     return records
