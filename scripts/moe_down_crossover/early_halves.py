@@ -28,7 +28,8 @@ def _replace_once(text, old, new):
     return text.replace(old, new)
 
 
-def adapt_worker(text):
+def adapt_worker(text, *, early_scheme=MIXED, early_policy=MIXED_POLICY,
+                 checkpoint_name=f"reciprocal_s42_{MIXED}_r2_{{hidden}}_moe_resume.pth"):
     """Change only the accepted fresh-fork checkpoint; retain native resume and metrics."""
     # The follow-on package adds exactly these two guards for a 100 -> 256 handoff.
     # Both belong only to the old continuation. Its otherwise identical worker is
@@ -45,11 +46,11 @@ def adapt_worker(text):
     if text.count('        if ck["settings"] != settings:\n') != 1:
         raise ValueError("缺少原分支严格的续训身份校验")
     text = _replace_once(text, 'f"fork1024_s42_{HIF4}_r2_{hidden}_moe_resume.pth"',
-                         f'f"reciprocal_s42_{MIXED}_r2_{{hidden}}_moe_resume.pth"')
+                         f'f"{checkpoint_name}"')
     text = _replace_once(
         text, '        if ck.get("quant_sim") != HIF4 or ck.get("residual_policy") != RESIDUAL:\n',
-        f'        if (ck.get("quant_sim") != {MIXED!r} or ck.get("residual_policy") != RESIDUAL\n'
-        f'                or ck.get("seed") != 42 or ck.get("projection_policy") != {MIXED_POLICY!r}):\n')
+        f'        if (ck.get("quant_sim") != {early_scheme!r} or ck.get("residual_policy") != RESIDUAL\n'
+        f'                or ck.get("seed") != 42 or ck.get("projection_policy") != {early_policy!r}):\n')
     compile(text, "fork_worker.py", "exec")
     return text
 
@@ -82,10 +83,11 @@ def _snapshot(path, scheme):
     return spec["files"]
 
 
-def _prepare(original, anchor, old, out, valid):
+def _prepare(original, anchor, old, out, valid, *, early_scheme=MIXED, checkpoint=CKPT,
+             worker_adapter=adapt_worker, late_b=MIXED):
     import torch
 
-    reference, candidate = _snapshot(original, HIF4), _snapshot(anchor, MIXED)
+    reference, candidate = _snapshot(original, HIF4), _snapshot(anchor, early_scheme)
     shared = {rel for rel in reference if rel.startswith(("model/", "data/", "dataset/"))}
     shared.add("trainer/trainer_utils.py")
     for name in shared:
@@ -120,16 +122,16 @@ def _prepare(original, anchor, old, out, valid):
         src = old / "scripts" / name
         _verify(src, hashes[name])
         code[name] = src.read_bytes()
-    code["fork_worker.py"] = adapt_worker(code["fork_worker.py"].decode("utf-8")).encode("utf-8")
+    code["fork_worker.py"] = worker_adapter(code["fork_worker.py"].decode("utf-8")).encode("utf-8")
     _verify(valid, VALID_SHA256)
     env = {"torch": str(torch.__version__), "cuda": torch.version.cuda,
            "datasets": version("datasets"), "transformers": version("transformers")}
     if "environment" in old_spec and env != old_spec["environment"]:
         raise ValueError(f"当前 Python 包与历史实验不匹配：{old_manifest}")
     manifest = {
-        "early_policy": MIXED, "late_a": HIF4, "late_b": MIXED,
+        "early_policy": early_scheme, "late_a": HIF4, "late_b": late_b,
         "early_prefix": str(anchor), "early_inputs_sha256": _hash(anchor / "inputs.json"),
-        "early_checkpoint_sha256": _hash(anchor / CKPT),
+        "early_checkpoint_sha256": _hash(anchor / checkpoint),
         "rng_sha256": [_hash(anchor / "rng" / f"micro-1024-rank-{r}.pt") for r in range(8)],
         "original_prefix": str(original), "original_inputs_sha256": _hash(original / "inputs.json"),
         "historic_scripts_sha256": hashes, "historic_manifest_sha256": _hash(old_manifest),
@@ -164,7 +166,7 @@ def _projection_counts(branch):
     return expected
 
 
-def _branch(anchor, out, branch):
+def _branch(anchor, out, branch, *, early_description="早期 down=MXFP8"):
     run = out / branch
     run.mkdir(exist_ok=True)
     command = [sys.executable, "-u", "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
@@ -174,7 +176,7 @@ def _branch(anchor, out, branch):
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1")
     env.setdefault("OMP_NUM_THREADS", "1")
     log = run / "console.log"
-    print(f"早期 down=MXFP8，后半程分支 {branch}，日志 {log}", flush=True)
+    print(f"{early_description}，后半程分支 {branch}，日志 {log}", flush=True)
     with log.open("a", encoding="utf-8") as dst:
         with subprocess.Popen(command, cwd=out, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, errors="replace") as process:

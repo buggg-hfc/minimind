@@ -73,8 +73,8 @@ def check_batch_order(previous, current, *, updates=256, world=8):
             rel = Path("hif4", "metrics", f"rank-{rank:02d}", f"update-{step:06d}.npz")
             with np.load(previous / rel, allow_pickle=False) as a, np.load(current / rel, allow_pickle=False) as b:
                 if a["input_sha256"].item() != b["input_sha256"].item():
-                    raise ValueError(f"四组间的训练输入不一致，rank {rank}，分叉后更新 {step}")
-    print(f"已配对核实四组后半程 {updates} 次更新 × {world} 个 rank 的输入及标签", flush=True)
+                    raise ValueError(f"配对分支的训练输入不一致，rank {rank}，分叉后更新 {step}")
+    print(f"已配对核实后半程 {updates} 次更新 × {world} 个 rank 的输入及标签", flush=True)
 
 
 def main():
@@ -83,14 +83,24 @@ def main():
                         default=Path(os.environ.get("MINIMIND_FORK_ROOT", "/data/lz/minimind-moe-fork-s42")),
                         help="已有 HiF4 公共前缀及两次配对实验的根目录")
     parser.add_argument("--check", action="store_true", help="只核对现有实验、环境和数据")
+    parser.add_argument("--single-experts", action="store_true",
+                        help="依次训练前半程仅 L6E2、L6E1 的 down_proj 使用 MXFP8 的两组对照")
     args = parser.parse_args()
     import torch
     root = args.root.expanduser().resolve()
     original, old, final = check_history(root, torch)
     if args.check:
+        if args.single_experts:
+            from expert_runs import controls
+            controls(final, root / "reciprocal-down-s42" / "pair-1024-to-2048")
+            print("HH、MH 参照验证通过。")
         return
     if torch.cuda.device_count() != 8:
         raise SystemExit("请在 8 张 V100 全部可见时执行")
+    if args.single_experts:
+        from expert_runs import run_experts
+        run_experts(root, original, old, final, check_batch_order)
+        return
     output = root / "reciprocal-down-s42"
     output.mkdir(exist_ok=True)
     with (output / ".experiment.lock").open("a") as lock:

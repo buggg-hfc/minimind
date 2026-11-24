@@ -17,7 +17,8 @@ BASE_SCHEME = "hif4_thr_3mm"
 RESIDUAL = "bf16_diff_shared_tensor_scale_v2"
 POLICY = {"attention": BASE_SCHEME, "ffn": {"gate_proj": BASE_SCHEME, "up_proj": BASE_SCHEME,
            "down_proj": "mxfp8"}, "router": "bf16", "lm_head": "bf16"}
-STATE = f"checkpoints/reciprocal_s42_{SCHEME}_r2_768_moe_resume.pth"
+STATE_TEMPLATE = "checkpoints/reciprocal_s42_{scheme}_r2_768_moe_resume.pth"
+STATE = STATE_TEMPLATE.format(scheme=SCHEME)
 VALID_SHA = "72bb2daa3e43457bebd118119f335fcebf6433077ab56ae2ab6f6f9f28f60a04"
 
 
@@ -34,14 +35,14 @@ def _require_hash(path, expected):
         raise ValueError(f"校验失败：{path}")
 
 
-def policy_code(frozen_worker):
+def policy_code(frozen_worker, scheme=SCHEME, policy=POLICY):
     """Copy only the dispatch function actually used by the completed branch."""
     defs = [n for n in ast.parse(frozen_worker).body if isinstance(n, ast.FunctionDef) and n.name == "configure"]
     if len(defs) != 1:
         raise ValueError("归档分支代码中找不到唯一的 configure")
     source = (
         "from collections import Counter\nimport torch\n"
-        f"HIF4 = {BASE_SCHEME!r}\nSCHEME = {SCHEME!r}\nRESIDUAL = {RESIDUAL!r}\nPOLICY = {POLICY!r}\n"
+        f"HIF4 = {BASE_SCHEME!r}\nSCHEME = {scheme!r}\nRESIDUAL = {RESIDUAL!r}\nPOLICY = {policy!r}\n"
         + ast.get_source_segment(frozen_worker, defs[0]) + "\n\n"
         "def anchored_checkpoint(native):\n"
         "    def checkpoint(*args, **kwargs):\n"
@@ -91,7 +92,7 @@ def patch_early_trainer(source):
     return source
 
 
-def _inputs(original, tools):
+def _inputs(original, tools, *, scheme=SCHEME, policy=POLICY, policy_writer=policy_code):
     manifest = original / "inputs.json"
     old = json.loads(manifest.read_text(encoding="utf-8"))
     pair_dir = tools.parent
@@ -114,14 +115,14 @@ def _inputs(original, tools):
         raise ValueError("种子 42 的训练集指纹发生变化")
     trainer = "trainer/train_pretrain.py"
     changed = {trainer: patch_early_trainer((original / trainer).read_text(encoding="utf-8")).encode("utf-8"),
-               "trainer/anchor_policy.py": policy_code(worker.read_text(encoding="utf-8")).encode("utf-8")}
+               "trainer/anchor_policy.py": policy_writer(worker.read_text(encoding="utf-8"), scheme, policy).encode("utf-8")}
     for package in ("model", "trainer", "dataset"):
         marker = package + "/__init__.py"
         if marker not in old["files"]:
             changed[marker] = b""
     hashes = dict(old["files"])
     hashes.update({rel: hashlib.sha256(data).hexdigest() for rel, data in changed.items()})
-    info = dict(scheme=SCHEME, projection_policy=POLICY, residual_policy=RESIDUAL, seed=42, world_size=8,
+    info = dict(scheme=scheme, projection_policy=policy, residual_policy=RESIDUAL, seed=42, world_size=8,
                 target_microbatch=1024, schedule_microbatches=2048, files=hashes,
                 source=str(original), source_inputs_sha256=_sha(manifest),
                 source_worker_sha256=pair["workers"]["fork_worker.py"], valid_sha256=VALID_SHA,
@@ -129,8 +130,8 @@ def _inputs(original, tools):
     return info, changed
 
 
-def _prepare(original, anchor, tools):
-    info, changed = _inputs(original, tools)
+def _prepare(original, anchor, tools, *, scheme=SCHEME, policy=POLICY, policy_writer=policy_code):
+    info, changed = _inputs(original, tools, scheme=scheme, policy=policy, policy_writer=policy_writer)
     if anchor.exists():
         if json.loads((anchor / "inputs.json").read_text(encoding="utf-8")) != info:
             raise ValueError(f"已有前缀与本次实验配置不匹配：{anchor}")
@@ -154,15 +155,15 @@ def _prepare(original, anchor, tools):
         _require_hash(anchor / rel, expected)
 
 
-def check_anchor(anchor, torch):
-    path = anchor / STATE
+def check_anchor(anchor, torch, *, scheme=SCHEME, policy=POLICY):
+    path = anchor / STATE_TEMPLATE.format(scheme=scheme)
     if not path.is_file():
         return 0
     c = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     step = c.get("step")
     if (not isinstance(step, int) or not 0 < step <= 1024 or step % 256 or
             (c.get("quant_sim"), c.get("residual_policy"), c.get("projection_policy"), c.get("seed"),
-             c.get("world_size"), c.get("epoch")) != (SCHEME, RESIDUAL, POLICY, 42, 8, 0)):
+             c.get("world_size"), c.get("epoch")) != (scheme, RESIDUAL, policy, 42, 8, 0)):
         raise ValueError(f"前缀断点的数值格式、步数或种子错误：{path}")
     moment_states = c["optimizer"]["state"]
     lr = 5e-4 * (0.1 + 0.45 * (1 + math.cos(math.pi * step / 2048)))
@@ -178,7 +179,7 @@ def check_anchor(anchor, torch):
     return step
 
 
-def make_anchor(original_prefix, anchor, tools_dir):
+def make_anchor(original_prefix, anchor, tools_dir, *, scheme=SCHEME, policy=POLICY, policy_writer=policy_code):
     """Prepare/run the early mixed half. tools_dir is the old pair's frozen scripts directory."""
     import torch
     original, anchor, tools = (Path(p).resolve() for p in (original_prefix, anchor, tools_dir))
@@ -190,8 +191,8 @@ def make_anchor(original_prefix, anchor, tools_dir):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit(f"正在生成同一前缀：{anchor}")
-        _prepare(original, anchor, tools)
-        step = check_anchor(anchor, torch)
+        _prepare(original, anchor, tools, scheme=scheme, policy=policy, policy_writer=policy_writer)
+        step = check_anchor(anchor, torch, scheme=scheme, policy=policy)
         if step < 1024:
             if torch.cuda.device_count() != 8:
                 raise RuntimeError("早期分支训练需要 8 张可见 GPU")
@@ -205,7 +206,7 @@ def make_anchor(original_prefix, anchor, tools_dir):
             env = dict(os.environ, PYTHONUNBUFFERED="1")
             env.setdefault("OMP_NUM_THREADS", "1")
             env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(anchor), env.get("PYTHONPATH","")]))
-            print(f"前半程仅专家 down 使用 MXFP8。microbatch {step} → 1024，日志 {anchor / 'prefix.log'}", flush=True)
+            print(f"前半程 {scheme}，microbatch {step} → 1024，日志 {anchor / 'prefix.log'}", flush=True)
             with (anchor / "prefix.log").open("a", encoding="utf-8") as f:
                 print(" ".join(cmd), file=f, flush=True)
                 with subprocess.Popen(cmd, cwd=anchor / "trainer", env=env, stdout=subprocess.PIPE,
@@ -216,7 +217,8 @@ def make_anchor(original_prefix, anchor, tools_dir):
                         f.flush()
                     if p.wait():
                         raise RuntimeError(f"训练中断，可用同一命令续训。日志：{anchor / 'prefix.log'}")
-            if check_anchor(anchor, torch) != 1024:
+            if check_anchor(anchor, torch, scheme=scheme, policy=policy) != 1024:
                 raise ValueError("未生成符合预期的专家 down MXFP8 前半程断点")
-        print(f"M_ANCHOR_READY {anchor / STATE}", flush=True)
-    return anchor / STATE
+        checkpoint = anchor / STATE_TEMPLATE.format(scheme=scheme)
+        print(f"M_ANCHOR_READY {checkpoint}", flush=True)
+    return checkpoint
