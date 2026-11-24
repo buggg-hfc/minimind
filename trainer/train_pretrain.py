@@ -16,6 +16,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.quant_linear import SIMULATION_SCHEMES, install_quantization
+from model.quant_policy import RESIDUAL_POLICY, RESIDUAL_SCHEMES, scheme_artifact_name, validate_resume_policy
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
@@ -84,7 +85,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             os.replace(ckp + '.tmp', ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler,
                           epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
-                          quant_sim=args.quant_sim, export_dtype=export_dtype)
+                          quant_sim=args.quant_sim, export_dtype=export_dtype,
+                          residual_policy=RESIDUAL_POLICY if args.quant_sim in RESIDUAL_SCHEMES else None)
             model.train()
             del state_dict
 
@@ -133,7 +135,7 @@ if __name__ == "__main__":
 
     simulating = args.quant_sim != 'none'
     if simulating:
-        args.save_weight = f'{args.save_weight}_{args.quant_sim}'
+        args.save_weight = f'{args.save_weight}_{scheme_artifact_name(args.quant_sim)}'
         torch.set_float32_matmul_precision('highest')
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -143,8 +145,8 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    if ckp_data and ckp_data.get('quant_sim', 'none') != args.quant_sim:
-        raise ValueError('Checkpoint quant_sim does not match the requested training format')
+    if ckp_data is not None:
+        validate_resume_policy(ckp_data, args.quant_sim)
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"

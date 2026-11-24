@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.autograd.function import once_differentiable
 
-from .quant_formats import quantize
+from .quant_formats import bf16_residual, compute_nv_tensor_scale, quantize
 
 SIMULATION_SCHEMES = (
     "bf16", "mxfp8", "hif4_thr_3mm", "nvfp4_3mm", "nvint4_3mm",
@@ -26,20 +26,20 @@ def gemm(lhs, rhs, scheme, *, lhs_is_dy=False, rhs_components=None):
 
     Group along the contracting dimension of each logical operand. In both backward
     products dY (or its transpose) is the left operand. Only NV variants scale dY
-    globally, and each invocation of quantize computes its scales from its input.
+    globally. Its residual reuses that FP32 scale, with fresh group scales.
     In inference, rhs_components can supply the same precomputed right operands.
     """
     with torch.autocast(device_type=lhs.device.type, enabled=False):
         if scheme == "bf16" or lhs.numel() == 0 or rhs.numel() == 0:
             return lhs @ rhs
-        dy_scale = lhs_is_dy and scheme in _NV_SCHEMES
+        dy_scale = compute_nv_tensor_scale(lhs, scheme) if lhs_is_dy and scheme in _NV_SCHEMES else False
         lhs0 = quantize(lhs, scheme, axis=1, tensor_scale=dy_scale)
         rhs0 = quantize(rhs, scheme, axis=0) if rhs_components is None else rhs_components[0]
         result = lhs0 @ rhs0
         if scheme != "mxfp8":
-            lhs1 = quantize(lhs - lhs0, scheme, axis=1, tensor_scale=dy_scale)
+            lhs1 = quantize(bf16_residual(lhs, lhs0), scheme, axis=1, tensor_scale=dy_scale)
             result.add_(lhs1 @ rhs0)
-            rhs1 = quantize(rhs - rhs0, scheme, axis=0) if rhs_components is None else rhs_components[1]
+            rhs1 = quantize(bf16_residual(rhs, rhs0), scheme, axis=0) if rhs_components is None else rhs_components[1]
             result.add_(lhs0 @ rhs1)
         return result
 
@@ -101,7 +101,7 @@ def _inference_weight_components(layer):
     main = rhs if scheme == "bf16" else quantize(rhs, scheme, axis=0)
     residual = None
     if scheme not in ("bf16", "mxfp8"):
-        residual = quantize(rhs - main, scheme, axis=0)
+        residual = quantize(bf16_residual(rhs, main), scheme, axis=0)
     parts = (main, residual)
     layer._weight_cache = (ref(weight), signature, parts)
     return parts

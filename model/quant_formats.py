@@ -6,6 +6,25 @@ from torch.nn import functional as F
 
 GROUP_SIZE = {"mxfp8": 32, "hif4_thr_3mm": 64, "nvfp4_3mm": 16, "nvint4_3mm": 16}
 UE5M3_MAX = 114688.0
+_NV_QMAX = {"nvfp4_3mm": 6.0, "nvint4_3mm": 7.0}
+
+
+def bf16_residual(original, reconstructed):
+    """Subtract BF16 operands and round the result to BF16 before FP32 reconstruction."""
+    return (original.to(torch.bfloat16) - reconstructed.to(torch.bfloat16)).float()
+
+
+@torch.no_grad()
+def compute_nv_tensor_scale(x, scheme):
+    """Return the FP32 scale for the entire main operand, reusable for its residual."""
+    if scheme not in _NV_QMAX:
+        raise ValueError("FP32 tensor scale is only defined for the NV schemes")
+    if x.numel() == 0:
+        return x.new_ones((), dtype=torch.float32)
+    maximum = x.float().abs().amax()
+    # Keep the divisor positive when a nonzero subnormal maximum would underflow.
+    scale = (maximum / (_NV_QMAX[scheme] * UE5M3_MAX)).clamp(min=2.0 ** -149)
+    return torch.where(maximum == 0, 1.0, scale)
 
 
 def _round_magnitude(x, fraction_bits, min_step_exponent, maximum):
@@ -49,15 +68,10 @@ def _hif4_thr(blocks):
     return torch.copysign((codes * 0.25) * micro_scale * base, groups).reshape_as(blocks)
 
 
-def _nv4(blocks, scheme, use_tensor_scale):
+def _nv4(blocks, scheme, tensor_scale):
     fp4 = scheme == "nvfp4_3mm"
-    qmax = 6.0 if fp4 else 7.0
-    # 'blocks' spans this entire logical operand (one expert for routed MLPs).
-    # Keep scale positive even when a nonzero subnormal amax would underflow.
-    if use_tensor_scale:
-        maximum = blocks.abs().amax()
-        tensor_scale = (maximum / (qmax * UE5M3_MAX)).clamp(min=2.0 ** -149)
-        tensor_scale = torch.where(maximum == 0, 1.0, tensor_scale)
+    qmax = _NV_QMAX[scheme]
+    if tensor_scale is not None:
         blocks = blocks / tensor_scale
     ideal = blocks.abs().amax(dim=-1, keepdim=True) / qmax
     group_scale = _round_magnitude(ideal, 3, -17, UE5M3_MAX)
@@ -69,22 +83,30 @@ def _nv4(blocks, scheme, use_tensor_scale):
     else:
         codes = torch.round(normalized).clamp(-7, 7)
     result = codes * group_scale
-    return result * tensor_scale if use_tensor_scale else result
+    return result * tensor_scale if tensor_scale is not None else result
 
 
 @torch.no_grad()
 def quantize(x, scheme, axis=-1, *, tensor_scale=False):
     """Quantize and reconstruct one operand, grouping along its GEMM reduction axis.
 
-    NV tensor scales apply only when requested by the caller for a backward dY.
-    A separate call for a residual recalculates every scale on that residual.
+    For NV, tensor_scale=True derives a scale from x. Passing a scalar FP32 tensor
+    uses that exact scale. False or None disables it. Group scales are fitted to x.
     """
     if x.ndim < 1 or not -x.ndim <= axis < x.ndim:
         raise ValueError("axis must index a dimension of the operand")
     if scheme != "bf16" and scheme not in GROUP_SIZE:
         raise ValueError(f"Unknown quantization scheme: {scheme}")
-    if tensor_scale and scheme not in ("nvfp4_3mm", "nvint4_3mm"):
-        raise ValueError("FP32 tensor scale is only defined for the NV schemes")
+    if tensor_scale is False:
+        tensor_scale = None
+    if tensor_scale is not None:
+        if scheme not in _NV_QMAX:
+            raise ValueError("FP32 tensor scale is only defined for the NV schemes")
+        if tensor_scale is True:
+            tensor_scale = compute_nv_tensor_scale(x, scheme)
+        elif (not isinstance(tensor_scale, torch.Tensor) or tensor_scale.ndim != 0
+              or tensor_scale.dtype != torch.float32 or tensor_scale.device != x.device):
+            raise ValueError("tensor_scale must be an FP32 scalar tensor on the operand's device")
     data = x.float()
     if scheme == "bf16":
         return data.to(torch.bfloat16).float()
