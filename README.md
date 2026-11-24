@@ -730,6 +730,37 @@ python scripts/minimind_v100_pilot.py moe-ffn-mxfp8 --groups grid --seed 42 --re
 
 评估投影对训练质量的影响时，按基础格式和种子配对，读取同一验证集的 BF16 前向 `mean_ce`。用每组 CE 减去原全 4-bit R2 对照的 CE，负值表示回退后改善。也可比较只差一个投影的两组，例如 `gate_down` 减去 `gate`，得到已经回退 gate 的条件下，再回退 down 的 CE 变化。
 
+**从现有 MoE 权重诊断算子误差、路由和 KL**
+
+在实验工作目录执行下列命令。默认读取当前工作目录（用 `--root` 指定）及 `/home/lz/minimind/out` 中的 pilot 导出权重。单张 V100 顺序比较 MXFP8、三组原全 4-bit R2 和 HiF4 的 `gate_down` 混合组，每个方案均使用相同的文档。数据和位置顺序、权重路径及 SHA256 都记录在 `manifest.json`。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /root/anaconda3/envs/lz/bin/python scripts/minimind_moe_diagnose.py \
+  --root "$PWD" --baseline-root /home/lz/minimind --device cuda:0 --route-lock
+```
+
+命令打印报告目录 `runs/v100-pilot/diagnostics/moe_s42_*/`。默认从验证集固定抽取 16 篇计算 KL 和 CE，其中前 4 篇用于算子前反向回放。需要复核整份验证集的数值时指定 `--documents 1024`，算子文档数可单独配置。默认每个微批 2 篇、长度 512，逐算子最多抽 4096 个输出位置。显式指定 `--schemes mxfp8 hif4_thr_3mm nvfp4_3mm nvint4_3mm grid` 可覆盖四种对照及全部 21 个混合配置。
+
+| 文件 | 统计口径 |
+|---|---|
+| `<方案>/components.csv`、`operators.csv` | 同一套冻结的权重，以 BF16 前反向得到共同的 X、W、dY。分别回放 BF16 和待测算子的 FWD、dX、dW。第一张表按投影和实际格式合并，第二张保留层号和专家号。 |
+| `<方案>/weight_hist_kl.csv` | 比较 BF16 训练与待测格式训练后同名权重的直方图。每个张量共用 128 个等宽区间，每个区间加 0.5 个计数。 |
+| `summary.csv`、`<方案>/*_documents.csv` | 在有预测目标的位置，计算全词表的 next-token KL、token 加权 CE、PPL。逐文档保留验证集索引、有效 token 数和求和项，方便配对比较。 |
+| `<方案>/*_routing.csv`、`*_margin_bins.csv`、`*_expert_loads.csv` | 在相同的有效预测位置按层比较 router 分布 KL、top-1 翻转率、top-1 与 top-2 概率差，以及各专家负载。 |
+
+算子误差定义为 `δ = 待测 − BF16`。同一对坐标分别记录 FP32 GEMM 输出（`raw`）和舍入到 BF16 的算子输出（`applied`）。指标包括 `signed_mean`（经验 E[δ]）、MAE、平均绝对相对误差、以 BF16 ULP 为单位的误差、方差留存率和五类符号变化。相对误差与五类符号以参考非零位置为分母，另计参考零值变为非零的位置。算子直方图 KL 按每次调用的配对样本划分共同的直方图区间，再按有限样本数加权。分层和合并指标按抽中的坐标计数，保留调用数、总元素数和采样数以便解释。空闲专家的空值表示缺少观测。
+
+算子默认锚定 BF16 训练权重，可用 `--operator-anchor candidate` 研究各自终点。同批标签、训练模式下的 CE 与 router 辅助损失、梯度累积除数 4 共同确定 dY。算子回放包含模型实际处理的 padding 行；表中的 E[δ] 只汇总这批回放样本。历史训练步的 E[δ]、梯度裁剪和 AdamW 更新轨迹需另采。
+
+`summary.csv` 的 KL 方向均为左侧参考分布到右侧待测分布。下列三项分别计算，不能把它们的 KL 相加。
+
+| comparison | 左侧 → 右侧 |
+|---|---|
+| `same_weights` | 待测训练权重 BF16 前向 → 同权重本组前向，测即时精度切换。 |
+| `trained_weights` | BF16 训练权重 BF16 前向 → 待测训练权重 BF16 前向，测权重轨迹留下的差异。 |
+| `end_to_end` | BF16 训练权重 BF16 前向 → 待测训练权重本组前向，测整体差异。 |
+| `same_weights_fixed_routes` | 可选。与 `same_weights` 使用相同权重，强制候选在每层把每个 token 派给 BF16 选中的专家。适用于本 pilot 的归一化 top-1 路由。比较自由和锁定路由的 CE/KL 可检验路由选择对即时前向误差的影响。 |
+
 模拟模式关闭原生 AMP 和 GradScaler。注意力 QK/PV、router 线性层和 LM head 使用共同的 BF16 乘法边界；softmax、归一化、残差流、主权重和优化器使用 FP32。该路径用于数值比较，运行时需要支持 Volta `sm_70` 的 PyTorch CUDA 构建。
 
 模拟权重以 FP32 导出，格式名自动追加到 `--save_weight`。例如默认前缀下，MoE 的 HiF4 权重写入 `out/pretrain_hif4_thr_3mm_r2_768_moe.pth`。使用相同训练命令加 `--from_resume 1` 恢复；不同种子的并行作业指定不同 `--save_weight`。从仓库根目录执行下列命令可选择评测前向精度或运行测试。
