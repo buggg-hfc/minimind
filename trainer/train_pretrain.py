@@ -15,8 +15,9 @@ from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from model.quant_linear import SIMULATION_SCHEMES, install_quantization
-from model.quant_policy import RESIDUAL_POLICY, RESIDUAL_SCHEMES, scheme_artifact_name, validate_resume_policy
+from model.quant_linear import install_quantization
+from model.quant_policy import (MIXED_SCHEMES, MODEL_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES,
+                                projection_policy, scheme_artifact_name, validate_resume_policy)
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
@@ -86,6 +87,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler,
                           epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
                           quant_sim=args.quant_sim, export_dtype=export_dtype,
+                          projection_policy=projection_policy(args.quant_sim) if args.quant_sim in MIXED_SCHEMES else None,
+                          seed=args.seed if args.quant_sim in MIXED_SCHEMES else None,
                           residual_policy=RESIDUAL_POLICY if args.quant_sim in RESIDUAL_SCHEMES else None)
             model.train()
             del state_dict
@@ -102,7 +105,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, help="训练设备，默认自动选择")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument('--quant_sim', choices=('none', *SIMULATION_SCHEMES), default='none',
+    parser.add_argument('--quant_sim', choices=('none', *MODEL_SCHEMES), default='none',
                         help='V100 数值模拟格式；选中时使用 FP32 承载并关闭原生 AMP')
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
@@ -121,6 +124,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
+    if args.quant_sim in MIXED_SCHEMES and not args.use_moe:
+        parser.error(f'--quant_sim {args.quant_sim} requires --use_moe 1')
 
     # Bind the rank and connect NCCL before loading model and dataset dependencies.
     local_rank = init_distributed_mode()
@@ -146,7 +151,7 @@ if __name__ == "__main__":
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     if ckp_data is not None:
-        validate_resume_policy(ckp_data, args.quant_sim)
+        validate_resume_policy(ckp_data, args.quant_sim, seed=args.seed)
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -167,6 +172,8 @@ if __name__ == "__main__":
     if simulating:
         install_quantization(model.float(), args.quant_sim)
         Logger(f'quant_sim={args.quant_sim} | FP32 carrier | AMP off | save_weight={args.save_weight}')
+        if args.quant_sim in MIXED_SCHEMES:
+            Logger(f'projection_policy={projection_policy(args.quant_sim)} | seed={args.seed}')
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(not simulating and args.dtype == 'float16'))

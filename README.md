@@ -701,6 +701,35 @@ NV 两组的 UE5M3 使用 5 位指数、3 位尾数、偏置 15，最小正值�
 
 使用新规则的三个 3MM 训练输出带 `_r2` 后缀，续训元数据和实验报告记录 `residual_policy=bf16_diff_shared_tensor_scale_v2`。重跑时可从仓库根目录执行 `python scripts/minimind_v100_pilot.py train nvfp4_3mm`，然后以 `eval nvfp4_3mm` 和 `eval nvfp4_3mm --eval-scheme same` 分别评估。各条命令加 `--moe` 即可切换到 MoE。
 
+**MiniMind-3-MoE 专家 FFN 回退实验**
+
+注意力的 Q/K/V/O 投影分别采用 `hif4_thr_3mm`、`nvfp4_3mm` 或 `nvint4_3mm`。对每种格式，把每层所有专家中的指定投影切换为 MXFP8。下表的“4-bit”表示该组注意力所用的同一种 R2 格式。
+
+| 投影组合 | `up_proj` | `gate_proj` | `down_proj` |
+|---|---|---|---|
+| 原全 4-bit 对照 | 4-bit | 4-bit | 4-bit |
+| `up` | MXFP8 | 4-bit | 4-bit |
+| `gate` | 4-bit | MXFP8 | 4-bit |
+| `down` | 4-bit | 4-bit | MXFP8 |
+| `up_gate` | MXFP8 | MXFP8 | 4-bit |
+| `up_down` | MXFP8 | 4-bit | MXFP8 |
+| `gate_down` | 4-bit | MXFP8 | MXFP8 |
+| `all` | MXFP8 | MXFP8 | MXFP8 |
+
+每个投影的格式同时用于前向、输入梯度 dX 和权重梯度 dW。负责选择专家的路由器 `mlp.gate`、注意力分数和上下文乘法（QK、PV）、输出头均沿用 BF16 模拟。
+
+从仓库根目录运行以下命令，在八张本地 V100 上依次跑完 3 种格式 × 7 种组合。输入为原 32k pilot 的 `runs/v100-pilot/data/train.jsonl` 和 `valid.jsonl`。
+
+```bash
+python scripts/minimind_v100_pilot.py moe-ffn-mxfp8 --groups grid --seed 42 --resume
+```
+
+省略 `--groups` 时仅跑原来的三个 `all` 实验。也可指定部分组合，例如 `--groups up gate down`。首次运行从随机初始化开始。同一工作目录下，`--resume` 复用已完成的训练和匹配的验证结果，接续未完成的训练。原 `all` 的方案名和文件名保持兼容，例如 `nvfp4_3mm_ffn_mxfp8`。单项和双项分别带有自己的组合名，例如 `nvfp4_3mm_ffn_up_mxfp8`、`nvfp4_3mm_ffn_gate_down_mxfp8`。
+
+每组使用统一 BF16 前向和本组混合前向分别验证。默认 seed 42、每卡 batch 2、累积 4 个微批、序列长度 512、训练 1 轮，和原 MoE pilot 对齐。seed 42 的验证 JSON 位于 `runs/v100-pilot/results/`，其他种子在其 `seed<N>/` 子目录。
+
+评估投影对训练质量的影响时，按基础格式和种子配对，读取同一验证集的 BF16 前向 `mean_ce`。用每组 CE 减去原全 4-bit R2 对照的 CE，负值表示回退后改善。也可比较只差一个投影的两组，例如 `gate_down` 减去 `gate`，得到已经回退 gate 的条件下，再回退 down 的 CE 变化。
+
 模拟模式关闭原生 AMP 和 GradScaler。注意力 QK/PV、router 线性层和 LM head 使用共同的 BF16 乘法边界；softmax、归一化、残差流、主权重和优化器使用 FP32。该路径用于数值比较，运行时需要支持 Volta `sm_70` 的 PyTorch CUDA 构建。
 
 模拟权重以 FP32 导出，格式名自动追加到 `--save_weight`。例如默认前缀下，MoE 的 HiF4 权重写入 `out/pretrain_hif4_thr_3mm_r2_768_moe.pth`。使用相同训练命令加 `--from_resume 1` 恢复；不同种子的并行作业指定不同 `--save_weight`。从仓库根目录执行下列命令可选择评测前向精度或运行测试。

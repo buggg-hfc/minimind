@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from model.quant_policy import RESIDUAL_POLICY, RESIDUAL_SCHEMES, scheme_artifact_name, validate_resume_policy
+from model.quant_policy import (MIXED_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES, projection_policy,
+                                scheme_artifact_name, validate_resume_policy)
 from scripts import minimind_v100_pilot as pilot
 
 
@@ -11,7 +12,12 @@ class PilotPolicyTest(unittest.TestCase):
     def test_resume_accepts_current_rules_and_original_reference_formats(self):
         for scheme in RESIDUAL_SCHEMES:
             self.assertEqual(scheme_artifact_name(scheme), scheme + "_r2")
-            validate_resume_policy({"quant_sim": scheme, "residual_policy": RESIDUAL_POLICY}, scheme)
+            checkpoint = {"quant_sim": scheme, "residual_policy": RESIDUAL_POLICY}
+            if scheme in MIXED_SCHEMES:
+                with self.assertRaisesRegex(ValueError, "projection_policy"):
+                    validate_resume_policy(checkpoint, scheme)
+                checkpoint["projection_policy"] = projection_policy(scheme)
+            validate_resume_policy(checkpoint, scheme)
             for old in ({"quant_sim": scheme}, {"quant_sim": scheme, "residual_policy": "old"}):
                 with self.assertRaisesRegex(ValueError, "residual_policy"):
                     validate_resume_policy(old, scheme)

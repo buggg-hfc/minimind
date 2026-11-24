@@ -6,7 +6,8 @@ import warnings
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
-from model.quant_linear import SIMULATION_SCHEMES, install_quantization
+from model.quant_linear import install_quantization
+from model.quant_policy import MIXED_SCHEMES, MODEL_SCHEMES
 from model.model_lora import *
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
@@ -40,7 +41,7 @@ def init_model(args):
 
 def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
-    parser.add_argument('--quant_sim', choices=('none', *SIMULATION_SCHEMES), default='none',
+    parser.add_argument('--quant_sim', choices=('none', *MODEL_SCHEMES), default='none',
                         help='原生 MiniMind 权重的前向数值模拟格式')
     parser.add_argument('--weight_cache_mib', type=int, default=0, help='每卡量化权重缓存上限（MiB），0 表示关闭')
     parser.add_argument('--prompts_jsonl', help='离线贪心生成，每行一个含字符串 prompt 的 JSON 对象')
@@ -63,6 +64,8 @@ def main():
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
+    if args.quant_sim in MIXED_SCHEMES and not args.use_moe:
+        parser.error(f'--quant_sim {args.quant_sim} requires --use_moe 1')
     if args.weight_cache_mib < 0 or (args.weight_cache_mib and args.quant_sim == 'none'):
         parser.error('--weight_cache_mib requires a simulation scheme and a nonnegative budget')
     if args.prompts_jsonl or args.output_jsonl:
