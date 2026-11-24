@@ -4,7 +4,8 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (issue #771)
+if sys.platform == "win32":
+    import datasets  # noqa: F401  # Load Arrow before torch on Windows (issue #771).
 import argparse
 import time
 import warnings
@@ -14,9 +15,7 @@ from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from model.model_minimind import MiniMindConfig
 from model.quant_linear import SIMULATION_SCHEMES, install_quantization
-from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
@@ -99,7 +98,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
+    parser.add_argument("--device", type=str, help="训练设备，默认自动选择")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument('--quant_sim', choices=('none', *SIMULATION_SCHEMES), default='none',
                         help='V100 数值模拟格式；选中时使用 FP32 承载并关闭原生 AMP')
@@ -120,14 +119,24 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
+
+    # Bind the rank and connect NCCL before loading model and dataset dependencies.
+    local_rank = init_distributed_mode()
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
+        Logger(f"DDP ready: {dist.get_world_size()} ranks")
+    elif args.device is None:
+        args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    from model.model_minimind import MiniMindConfig
+    from dataset.lm_dataset import PretrainDataset
+
     simulating = args.quant_sim != 'none'
     if simulating:
         args.save_weight = f'{args.save_weight}_{args.quant_sim}'
         torch.set_float32_matmul_precision('highest')
 
     # ========== 1. 初始化环境和随机种子 ==========
-    local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
