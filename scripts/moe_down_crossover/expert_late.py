@@ -6,7 +6,7 @@ from pathlib import Path
 
 from early_halves import (BRANCHES, VALID_SHA256, _branch, _prepare, _read,
                           _replace_once, adapt_worker)
-from expert_prefix import expert_policy, expert_scheme, expert_state
+from expert_prefix import ALL_EXCEPT_L6E1, COMPLEMENT_MODULES, expert_policy, expert_scheme, expert_state
 
 
 def adapt_expert_worker(source, expert):
@@ -36,6 +36,21 @@ def adapt_expert_worker(source, expert):
         finally:
             if relative == 0:
                 target._simulation_scheme = HIF4
+'''
+    if expert == ALL_EXCEPT_L6E1:
+        source = _replace_once(source, "def check_cursor(", COMPLEMENT_MODULES + "\n\ndef check_cursor(")
+        replacement = f'''        score_scheme = args.branch
+        others = _other_expert_down_projections(raw) if relative == 0 else ()
+        try:
+            for module in others:
+                module._simulation_scheme = "mxfp8"
+            if others:
+                score_scheme = {scheme!r}
+            score = evaluate(raw, valid_ds, device, batch_size=2, branch_dir=out,
+                             updates_since_fork=relative, valid_sha256=valid_hash, scheme=score_scheme)
+        finally:
+            for module in others:
+                module._simulation_scheme = HIF4
 '''
     source = _replace_once(source, call, replacement)
     compile(source, "fork_worker.py", "exec")
@@ -72,7 +87,9 @@ def finish_expert(original, anchor, old_pair, out, expert):
                  checkpoint=expert_state(expert), worker_adapter=partial(adapt_expert_worker, expert=expert),
                  late_b=None)
         branch = BRANCHES[0]
-        _branch(anchor, out, branch, early_description=f"前半程仅第 6 层专家 {expert} 的 down_proj 使用 MXFP8")
+        desc = ("前半程除 L6E1 外的 31 个专家 down_proj 使用 MXFP8" if expert == ALL_EXCEPT_L6E1
+                else f"前半程仅第 6 层专家 {expert} 的 down_proj 使用 MXFP8")
+        _branch(anchor, out, branch, early_description=desc)
         run = out / branch
         midpoint = _validation(run, 0, scheme)
         final = _validation(run, 256, branch)

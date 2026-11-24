@@ -83,8 +83,11 @@ def main():
                         default=Path(os.environ.get("MINIMIND_FORK_ROOT", "/data/lz/minimind-moe-fork-s42")),
                         help="已有 HiF4 公共前缀及两次配对实验的根目录")
     parser.add_argument("--check", action="store_true", help="只核对现有实验、环境和数据")
-    parser.add_argument("--single-experts", action="store_true",
+    cases = parser.add_mutually_exclusive_group()
+    cases.add_argument("--single-experts", action="store_true",
                         help="依次训练前半程仅 L6E2、L6E1 的 down_proj 使用 MXFP8 的两组对照")
+    cases.add_argument("--except-l6e1", action="store_true",
+                       help="只补前半程除 L6E1 以外的 31 个专家 down_proj 使用 MXFP8 的一组")
     args = parser.parse_args()
     import torch
     root = args.root.expanduser().resolve()
@@ -94,9 +97,17 @@ def main():
             from expert_runs import controls
             controls(final, root / "reciprocal-down-s42" / "pair-1024-to-2048")
             print("HH、MH 参照验证通过。")
+        if args.except_l6e1:
+            from expert_complement import reference_rows
+            reference_rows(root, final)
+            print("HH、MH 和 L6E1 参照验证通过。")
         return
     if torch.cuda.device_count() != 8:
         raise SystemExit("请在 8 张 V100 全部可见时执行")
+    if args.except_l6e1:
+        from expert_complement import run_complement
+        run_complement(root, original, old, final, check_batch_order)
+        return
     if args.single_experts:
         from expert_runs import run_experts
         run_experts(root, original, old, final, check_batch_order)
