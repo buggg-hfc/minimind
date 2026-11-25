@@ -140,3 +140,28 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 /root/anaconda3/envs/lz/bin/python \
 
 - `noise_runs.csv` 给出每组绝对验证 CE、PPL。对同一格式，`delta_ce_vs_repeat` 为该组 CE 减本轮原样复跑 CE，`warmup_minus_no_warmup_same_lr_ce` 为相同 LR 倍率下 warmup 减无 warmup，负值表示 warmup 改善。
 - `noise_summary.csv` 给出本轮复跑与历史值的差，以及所测纯微扰相对本轮复跑的最大绝对 CE 差。warmup 单独汇总。这些幅度描述 seed 42 上实际测得的敏感性，估计跨次复跑的随机方差还需要独立重复。
+
+## 四个 seed 的逐步训练交叉熵
+
+用原始训练日志绘制 seed 42、43、100、2026 的 Dense 和 MoE 曲线，每个 seed 两张图，每张图叠加 BF16、MXFP8、HiF4 THR 3MM、NVFP4 3MM 和 NVINT4 3MM。上图显示五种格式的训练交叉熵，下图显示相同 microbatch 与 MXFP8 的差。八张图共用坐标范围，未作平滑。
+
+横轴为 AdamW 更新步。每条曲线在第 5、10、…、510、512 次更新各有一个观测，记录 rank 0 当前 microbatch 的 `logits_loss`（nat/token，四位小数）。这个字段已扣除 MoE 路由辅助损失。终点表 `same_format_validation.csv` 记录模型在验证集上的 CE，采用不同的数据和聚合方式。
+
+在训练机的本版本仓库根目录执行：
+
+```bash
+/root/anaconda3/envs/lz/bin/python scripts/minimind_collect_lce.py \
+  --out /data/lz/minimind-training-lce --plot
+```
+
+省略 `--plot` 可以仅用 Python 标准库导出 `training_lce.csv`（40 组 × 103 个采样点）。脚本从原 pilot 读取 seed 42 日志，其他三个 seed 按多 seed 网格报告的 `source_work` 查找。4-bit 日志使用 R2 版本。若已把日志复制到其他机器，可重复使用 `--log-dir <日志目录>`。
+
+在已安装 Matplotlib 和中文字体的工作机上，也可以直接从 CSV 绘图：
+
+```bash
+python scripts/minimind_plot_lce.py \
+  --csv /data/lz/minimind-training-lce/training_lce.csv \
+  --out /data/lz/minimind-training-lce
+```
+
+图名为 `seed42_dense.png`、`seed42_moe.png` 等。可用 `--font /path/to/NotoSansCJK-Regular.ttc` 指定字体。
