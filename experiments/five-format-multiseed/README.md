@@ -110,3 +110,33 @@ MoE 的 NVFP4 在 seed 42、43、2026 同时出现了比 MXFP8 更低的权重�
 - 层 6（此前单专家 HiF4 回退所在层）的三个专家投影分别都是 4/4 负。上述 NVFP4 与 MXFP8 的终点比较，与早前 HiF4 的前半程精度干预衡量不同问题。
 - 横向核对其他格式，HiF4 3MM 的层 2 专家 FFN 相对 MXFP8 的正向权重 KL 差同样四次为正（依 seed 为 +0.2410、+0.1514、+0.0699、+0.0686，单位 10⁻⁴ nat），但 HiF4 在其中两个 seed 的验证 CE 反而更低。NVINT4 的层 2 专家 FFN 则仅在 100 和 2026 高于 MXFP8。仅用该层 KL 差的正负，无法区分不同格式的 CE 表现。
 - 层 2 是在检查全部八层后发现的候选。其 ΔK 最大的 seed 2026 恰好有最小的验证 CE 差（NVFP4 − MXFP8 为 +0.00560 nat/token）。要核查这层对 CE 的影响，可从同一初始化与数据顺序配对训练：在 NVFP4 基础上，仅将层 2 全部专家的 up_proj 和 gate_proj 换成 MXFP8，以原 NVFP4 为基准，并用层 6 的同样回退作为同规模对照。保留相同验证集和终点评估步数。
+
+## Seed 42 的 MoE 微扰与学习率 warmup
+
+在 8 张 V100 上，从相同种子分别复跑 BF16 和 MXFP8，每组完成 512 次 AdamW 更新。验证前向沿用该组训练格式。主指标是 236,442 个有效预测 token 上的平均交叉熵（nat/token），PPL 为其指数，路由辅助损失仅用于训练。
+
+在检出本版本的仓库根目录执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 /root/anaconda3/envs/lz/bin/python \
+  scripts/minimind_moe_noise_floor.py \
+  --data /home/lz/minimind/runs/v100-pilot/data \
+  --output /data/lz/minimind-moe-noise-s42 \
+  --scenarios repeat lr_x1p0001 lr_x0p9999 warmup26
+```
+
+| 组别 | 基础 LR | 前 26 次更新 | 比较对象 |
+|---|---:|---|---|
+| `repeat` | 0.00050000 | 原余弦曲线 | 同格式历史 seed 42 |
+| `lr_x1p0001` | 0.00050005 | 原余弦曲线整体乘 1.0001 | 同格式本轮 repeat |
+| `lr_x0p9999` | 0.00049995 | 原余弦曲线整体乘 0.9999 | 同格式本轮 repeat |
+| `warmup26` | 0.00050000 | 线性升至原曲线在第 26 次更新的 LR | 同格式本轮 repeat |
+
+每 4 个 microbatch 更新一次。以第 1 至 512 次更新为序号，基础 LR 组的 warmup 第 1 次更新取 0.00001912088，第 26 次取 0.00049714282。第 26 次起与同倍率原曲线逐步相同。中断后用相同命令恢复至最近保存的训练进度，完成的训练和有效评估会复用。
+
+可在相同输出目录追加 `--scenarios warmup26_lr_x1p0001 warmup26_lr_x0p9999`，凑齐每种格式的 3 个 LR 倍率 × 2 种日程。另可追加 `swap12`（每个 rank 交换第一个累积窗口里的前两个 microbatch）或 `init_1ulp`（第 0 层注意力 q_proj 权重的 [0,0] 增加一个朝正无穷方向的 BF16 ULP）。每个场景增加两次训练。
+
+每完成一组就更新输出目录中的两个 CSV：
+
+- `noise_runs.csv` 给出每组绝对验证 CE、PPL。对同一格式，`delta_ce_vs_repeat` 为该组 CE 减本轮原样复跑 CE，`warmup_minus_no_warmup_same_lr_ce` 为相同 LR 倍率下 warmup 减无 warmup，负值表示 warmup 改善。
+- `noise_summary.csv` 给出本轮复跑与历史值的差，以及所测纯微扰相对本轮复跑的最大绝对 CE 差。warmup 单独汇总。这些幅度描述 seed 42 上实际测得的敏感性，估计跨次复跑的随机方差还需要独立重复。
