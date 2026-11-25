@@ -143,6 +143,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 /root/anaconda3/envs/lz/bin/python \
 
 ## 四个 seed 的逐步训练交叉熵
 
+[查看 8 张中文训练曲线](training-lce/README.md) · [下载逐步训练 Lce 数据](training-lce/training_lce.csv)
+
 用原始训练日志绘制 seed 42、43、100、2026 的 Dense 和 MoE 曲线，每个 seed 两张图，每张图叠加 BF16、MXFP8、HiF4 THR 3MM、NVFP4 3MM 和 NVINT4 3MM。上图显示五种格式的训练交叉熵，下图显示相同 microbatch 与 MXFP8 的差。八张图共用坐标范围，未作平滑。
 
 横轴为 AdamW 更新步。每条曲线在第 5、10、…、510、512 次更新各有一个观测，记录 rank 0 当前 microbatch 的 `logits_loss`（nat/token，四位小数）。这个字段已扣除 MoE 路由辅助损失。终点表 `same_format_validation.csv` 记录模型在验证集上的 CE，采用不同的数据和聚合方式。
