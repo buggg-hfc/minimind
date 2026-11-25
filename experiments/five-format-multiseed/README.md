@@ -167,3 +167,21 @@ python scripts/minimind_plot_lce.py \
 ```
 
 图名为 `seed42_dense.png`、`seed42_moe.png` 等。可用 `--font /path/to/NotoSansCJK-Regular.ttc` 指定字体。
+
+## 三种 4-bit 的 26 步 warmup 与低学习率对照
+
+在 seed 42 的 MiniMind-MoE 上同格式训练、同格式验证。HiF4 THR、NVINT4 和 NVFP4 都沿用 R2 的三次矩阵乘，路由器和输出头沿用原模型策略。两档基础 LR 都使用 26 次 AdamW 更新的线性 warmup，第 26 次接入该档基础 LR 对应的原余弦曲线，总计 512 次更新。每个实验都从同一随机初始化开始，重跑命令时会检查并恢复该档学习率与格式的进度。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+/root/anaconda3/envs/lz/bin/python scripts/minimind_moe_fp4_warmup.py --lr 5e-4 1e-4
+```
+
+| 基础 LR | 默认新训练的格式 | 同学习率的 warmup 对照 |
+|---:|---|---|
+| 5e-4 | HiF4、NVINT4、NVFP4 | 从已完成的 noise_runs.csv 读取 MXFP8 warmup26 |
+| 1e-4 | MXFP8、HiF4、NVINT4、NVFP4 | 本轮 1e-4 的 MXFP8 |
+
+可以只传一档 `--lr`，也可以用 `--schemes hif4_thr_3mm`、`--schemes nvint4_3mm` 或 `--schemes nvfp4_3mm` 单跑。若低 LR 只跑 4-bit，随后用 `--lr 1e-4 --schemes mxfp8` 补齐对照，脚本会重算汇总。
+
+默认数据目录为 `/home/lz/minimind/runs/v100-pilot/data`，旧对照表为 `/data/lz/minimind-moe-noise-s42/noise_runs.csv`，可用 `--data` 和 `--noise-runs` 指定。新实验按 LR 分目录写入 `/data/lz/minimind-moe-4bit-warmup-s42`。每训练并验证完一组即更新 `warmup_comparison.csv`。其中 `mean_ce` 和 `ppl` 来自 236,442 个有效验证 token，`gap_vs_mxfp8_warmup` 为相同 LR、相同日程下本格式 CE 减 MXFP8 CE，`low_lr_minus_base_lr_warmup_ce` 为同格式 warmup 下 1e-4 的 CE 减 5e-4 的 CE。缺少配对结果时相应差值留空。
