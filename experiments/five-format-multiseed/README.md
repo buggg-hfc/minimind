@@ -48,3 +48,25 @@ MoE 的 MXFP8 在 seed 2026 得到自身四次中的最低 CE（4.260391），�
 两者在 HH 中的负载相差约 0.40 个百分点，在同一层内覆盖了较低与较高的相对更新分歧。这给出了一个负载接近的探索性对照。相对 L2 为跨步采样更新差的 L2 范数除以 HH 更新范数，覆盖后半程 3,715,155 个配对有效位置。[32 位专家的完整统计](../moe-fp4-seed42/expert_updates_HH_HM.csv) · [字段与分母](../moe-fp4-seed42/COLUMNS.md)
 
 在后续单专家干预中，前 256 次更新仅将目标专家的 `down_proj` 改为 MXFP8，后 256 次及终点评估统一使用 HiF4 策略。seed 42 的终点 CE 为 L6E1 **4.262189**、L6E2 **4.303534**；全程 HiF4 的分叉对照 HH 为 **4.330909**，前半程全部专家 down 用 MXFP8 的对照 MH 为 **4.264549**。本组中，后半程诊断里相对更新分歧较小的 E1，其前半程干预带来的终点 CE 改善反而较大。这些干预只覆盖一个 seed、两个单专家。40 组主表的 seed 42 MoE HiF4 取历史完整训练的 **4.330955**，与分叉对照 HH 分开记录。[四组干预原值](expert_interventions_seed42.csv)
+
+## 训练终点的权重直方图 KL
+
+在保有终点权重的八卡 V100 训练机上，从包含本脚本的仓库目录运行下面的命令。计算使用 CPU，可以与后续 GPU 实验分开运行。
+
+```bash
+/root/anaconda3/envs/lz/bin/python scripts/minimind_multiseed_weight_kl.py \
+  --grid-output /data/lz/minimind-five-format-grid \
+  --legacy-root /home/lz/minimind \
+  --seeds 42 43 100 2026 --threads 4
+```
+
+默认同时处理 Dense 与 MoE 的全部五种方案。程序按网格 CSV 的 `source_work` 查找已评估的权重并支持历史 seed 42 的 R2 导出。每一组取相同架构、相同 seed 的 BF16 训练终点作为参照，直接比较训练器保存的 FP32 权重。权重 KL 的计算只依赖模型参数。输出中的验证 CE 和 PPL 来自已有终点评估。
+
+| 文件（默认在 `--grid-output` 的 `weight_kl/` 子目录） | 内容 |
+|---|---|
+| `weight_kl_summary.csv` | 每个模型一行。主指标 `weight_kl_forward` 为 BF16 → 本组的权重直方图 KL。另给出反向 KL、Jeffreys 双向之和、参与统计的张量数和参数数、两组检查点路径与同格式验证 CE/PPL。 |
+| `weight_kl_by_tensor.csv` | 每个权重张量一行，带模块名、层号、专家号、参数数与双向 KL。可以从这里单看专家的 `down_proj`，或按组件以 `elements` 加权。 |
+
+对每个同名权重张量，使用两组权重的联合最小值与最大值构造 128 个等宽桶，保留正负号，每个桶加 0.5 再归一化。以自然对数计算 KL，再按每个张量的元素数加权得到全模型指标。统计包含嵌入、归一化、注意力、FFN 和 MoE 路由器，共享的输入嵌入与输出头计一次。BF16 自比较应为 0。同形张量即使逐坐标不同，也可能有相同的值分布；解释模型行为可结合独立的验证 CE 或下一 token KL。
+
+若单独跑某个子集，可用 `--seeds 42 --architectures moe --output /data/lz/minimind-five-format-grid/weight_kl_s42_moe` 保留独立输出。完整的四个 seed 预期有 40 行模型汇总，其中 BF16 自比较占 8 行。

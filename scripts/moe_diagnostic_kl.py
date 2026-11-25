@@ -217,7 +217,7 @@ def weight_kl_rows(reference_state, candidate_state, *, layers=None):
         if not math.isfinite(lo) or not math.isfinite(hi):
             raise ValueError(f"Nonfinite weights: {name}")
         fwd = rev = 0.
-        if lo != hi:
+        if lo != hi and a is not b:
             def histogram(v):
                 h = np.zeros(128, dtype=np.float64)
                 for start in range(0, v.size, 1 << 20):
