@@ -132,6 +132,23 @@ class OperatorProbeTest(unittest.TestCase):
             self.assertTrue(all(r["sampled_count"] <= 5 and r["calls"] <= 1 for r in p.rows()))
         self.assertEqual(probes[0].rows(), probes[1].rows())
 
+    def test_weight_gradient_replay_follows_the_mxfp8_override(self):
+        # Observe identical BF16 operands for each policy, including the same sampled coordinates.
+        ids = torch.randint(0, 48, (2, 8))
+        results = {}
+        for scheme in ("hif4_thr_3mm", "mxfp8", "hif4_thr_3mm_dw_mxfp8"):
+            self.model.zero_grad(set_to_none=True)
+            with OperatorProbe(self.model, scheme, [0], max_elements=16) as probe:
+                self.model(ids, labels=ids).loss.backward()
+            results[scheme] = (probe.rows(), probe.component_rows())
+        for hybrid, base, mxfp8 in zip(results["hif4_thr_3mm_dw_mxfp8"],
+                                       results["hif4_thr_3mm"], results["mxfp8"]):
+            self.assertEqual(len(hybrid), len(base))
+            self.assertEqual(len(hybrid), len(mxfp8))
+            for row, base_row, mx_row in zip(hybrid, base, mxfp8):
+                want = mx_row if row["gemm"] == "dW" else base_row
+                self.assertEqual(row, {**want, "scheme": "hif4_thr_3mm_dw_mxfp8"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,11 +13,13 @@ from minimind_moe_paired_seeds import DEFAULT_DATA, SPLITS, digest
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCHEMES = ("hif4_thr_3mm", "nvint4_3mm", "nvfp4_3mm", "mxfp8", "bf16")
+FOUR_BIT = ("hif4_thr_3mm", "nvint4_3mm", "nvfp4_3mm")
+SCHEMES = (*FOUR_BIT, "mxfp8", "bf16")
+DW_SCHEMES = tuple(f"{base}_dw_mxfp8" for base in FOUR_BIT)
 ARCHITECTURES = ("dense", "moe")
 
 
-def prepare(output, data, seeds):
+def prepare(output, data, seeds, schemes=SCHEMES):
     """Freeze training sources, split bytes and protocol independently of older pilots."""
     output, data = Path(output).resolve(), Path(data).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -31,7 +33,7 @@ def prepare(output, data, seeds):
     for name, expected in SPLITS.items():
         if hashes[f"runs/v100-pilot/data/{name}.jsonl"] != expected:
             raise ValueError(f"{name}.jsonl SHA256 与原始 32k pilot 不符")
-    plan = dict(seeds=list(seeds), architectures=list(ARCHITECTURES), schemes=list(SCHEMES),
+    plan = dict(seeds=list(seeds), architectures=list(ARCHITECTURES), schemes=list(schemes),
                 effective_updates=512, microbatches=2048, world_size=8, seq_len=512, batch_per_gpu=2,
                 accumulation=4, native_sampler_seed=0, train_documents=32768, validation_documents=1024,
                 validation_targets=236442, files=hashes, runner_sha256=digest(Path(__file__)),
@@ -63,7 +65,7 @@ def prepare(output, data, seeds):
 def arm_paths(work, architecture, seed, scheme):
     from model.quant_policy import scheme_artifact_name
 
-    if architecture not in ARCHITECTURES or scheme not in SCHEMES:
+    if architecture not in ARCHITECTURES or scheme not in (*SCHEMES, *DW_SCHEMES):
         raise ValueError(f"Unsupported pilot case: {architecture}, {scheme}")
     name = scheme_artifact_name(scheme)
     suffix = "_moe" if architecture == "moe" else ""
@@ -99,7 +101,7 @@ def check_finished(path, seed, scheme):
 
 
 def read_score(path, architecture, seed, scheme):
-    from model.quant_policy import RESIDUAL_SCHEMES, RESIDUAL_POLICY, scheme_artifact_name
+    from model.quant_policy import RESIDUAL_SCHEMES, RESIDUAL_POLICY, projection_policy, scheme_artifact_name
 
     score = json.loads(path.read_text(encoding="utf-8"))
     suffix = "_moe" if architecture == "moe" else ""
@@ -109,6 +111,9 @@ def read_score(path, architecture, seed, scheme):
                     valid_sha256=SPLITS["valid"], checkpoint=filename)
     if scheme in RESIDUAL_SCHEMES:
         expected.update(residual_policy=RESIDUAL_POLICY, eval_residual_policy=RESIDUAL_POLICY)
+    if scheme in DW_SCHEMES:
+        policy = projection_policy(scheme)
+        expected.update(train_projection_policy=policy, eval_projection_policy=policy)
     ce, ppl = score["mean_ce"], score["ppl"]
     if (any(score.get(k) != v for k, v in expected.items()) or not math.isfinite(ce) or ce < 0
             or not math.isfinite(ppl) or ppl < 1 or not math.isclose(math.log(ppl), ce, rel_tol=1e-8)):

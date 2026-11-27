@@ -16,7 +16,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.quant_linear import install_quantization
-from model.quant_policy import (MIXED_SCHEMES, MODEL_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES,
+from model.quant_policy import (MIXED_SCHEMES, MODEL_SCHEMES, POLICY_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES,
                                 projection_policy, scheme_artifact_name, validate_resume_policy)
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -87,8 +87,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler,
                           epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
                           quant_sim=args.quant_sim, export_dtype=export_dtype,
-                          projection_policy=projection_policy(args.quant_sim) if args.quant_sim in MIXED_SCHEMES else None,
-                          seed=args.seed if args.quant_sim in MIXED_SCHEMES else None,
+                          projection_policy=projection_policy(args.quant_sim) if args.quant_sim in POLICY_SCHEMES else None,
+                          seed=args.seed if args.quant_sim in POLICY_SCHEMES else None,
                           residual_policy=RESIDUAL_POLICY if args.quant_sim in RESIDUAL_SCHEMES else None)
             model.train()
             del state_dict
@@ -172,7 +172,7 @@ if __name__ == "__main__":
     if simulating:
         install_quantization(model.float(), args.quant_sim)
         Logger(f'quant_sim={args.quant_sim} | FP32 carrier | AMP off | save_weight={args.save_weight}')
-        if args.quant_sim in MIXED_SCHEMES:
+        if args.quant_sim in POLICY_SCHEMES:
             Logger(f'projection_policy={projection_policy(args.quant_sim)} | seed={args.seed}')
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None

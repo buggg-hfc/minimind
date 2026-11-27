@@ -58,10 +58,11 @@ def _linear_output(x, weight, bias, scheme, rhs_components=None):
 
 class _SimulatedLinear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, bias, scheme):
+    def forward(ctx, x, weight, bias, scheme, dw_scheme):
         ctx.save_for_backward(x, weight)
         ctx.bias_dtype = bias.dtype if bias is not None else None
         ctx.scheme = scheme
+        ctx.dw_scheme = dw_scheme
         return _linear_output(x, weight, bias, scheme)
 
     @staticmethod
@@ -75,11 +76,11 @@ class _SimulatedLinear(torch.autograd.Function):
             dx = _bf16_value(dx).reshape_as(x).to(x.dtype)
         if ctx.needs_input_grad[1]:
             inputs = _bf16_value(x.reshape(-1, weight.shape[1]))
-            dw = gemm(dy.T, inputs, ctx.scheme, lhs_is_dy=True)
+            dw = gemm(dy.T, inputs, ctx.dw_scheme, lhs_is_dy=True)
             dw = _bf16_value(dw).to(weight.dtype)
         if ctx.needs_input_grad[2]:
             db = _bf16_value(dy.sum(dim=0)).to(ctx.bias_dtype)
-        return dx, dw, db, None
+        return dx, dw, db, None, None
 
 
 def _weight_cache_bytes(weight, scheme):
@@ -115,7 +116,8 @@ def _simulated_forward(self, x):
             parts = _inference_weight_components(self)
             return _linear_output(x, self.weight, self.bias, self._simulation_scheme, parts)
         self._weight_cache = None
-    return _SimulatedLinear.apply(x, self.weight, self.bias, self._simulation_scheme)
+    scheme = self._simulation_scheme
+    return _SimulatedLinear.apply(x, self.weight, self.bias, scheme, self._dw_scheme_override or scheme)
 
 
 def install_quantization(model, scheme, *, weight_cache_mib=0):
@@ -125,7 +127,9 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
     experts, router, and shared embedding/head retain their original identities.
     In mixed MoE schemes the selected gate/up/down projections in every expert use
     MXFP8 for forward, dX, and dW. The other expert projections and Q/K/V/O use
-    the base 4-bit format. All simulated schemes use BF16 for the router and head.
+    the base 4-bit format. Router and head FWD/dX use BF16. In a *_dw_mxfp8 scheme
+    every linear weight GEMM uses MXFP8, including the router and tied output head.
+    The embedding lookup still contributes its own gradient to the shared weight.
     A positive inference cache budget reserves slots in module order, filled on first
     use under eval/no-grad. The budget covers persistent reconstructed weights, not
     transient GEMM/quantization workspaces. Reinstalling clears all old entries.
@@ -151,7 +155,7 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
         if scheme == "none":
             if hasattr(module, "_simulation_scheme"):
                 original = module._original_instance_forward
-                del module._simulation_scheme, module._original_instance_forward
+                del module._simulation_scheme, module._dw_scheme_override, module._original_instance_forward
                 del module._cache_capacity, module._weight_cache
                 if original is None:
                     del module.forward
@@ -163,6 +167,7 @@ def install_quantization(model, scheme, *, weight_cache_mib=0):
             module.forward = MethodType(_simulated_forward, module)
         layer_scheme = policy[_PROJECTION_ROLES[leaf]]
         module._simulation_scheme = layer_scheme[leaf] if isinstance(layer_scheme, dict) else layer_scheme
+        module._dw_scheme_override = policy.get("dW")
         size = _weight_cache_bytes(module.weight, module._simulation_scheme)
         module._cache_capacity = size if size <= remaining else 0
         remaining -= module._cache_capacity

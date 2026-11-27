@@ -17,17 +17,21 @@ def ffn_mxfp8_scheme(base, group):
 _MIXED_POLICIES = {ffn_mxfp8_scheme(base, group): (base, group)
                    for base in FOUR_BIT_SCHEMES for group in FFN_MXFP8_GROUPS}
 MIXED_SCHEMES = {scheme: base for scheme, (base, _) in _MIXED_POLICIES.items()}
-MODEL_SCHEMES = (*SIMULATION_SCHEMES, *MIXED_SCHEMES)
-RESIDUAL_SCHEMES = {*FOUR_BIT_SCHEMES, *MIXED_SCHEMES}
+DW_MXFP8_SCHEMES = {f"{base}_dw_mxfp8": base for base in FOUR_BIT_SCHEMES}
+POLICY_SCHEMES = {*MIXED_SCHEMES, *DW_MXFP8_SCHEMES}
+MODEL_SCHEMES = (*SIMULATION_SCHEMES, *MIXED_SCHEMES, *DW_MXFP8_SCHEMES)
+RESIDUAL_SCHEMES = {*FOUR_BIT_SCHEMES, *POLICY_SCHEMES}
 RESIDUAL_POLICY = "bf16_diff_shared_tensor_scale_v2"
 
 
 def projection_policy(scheme):
-    """Return the primitive linear formats for a model-level precision scheme."""
+    """Return projection formats for FWD/dX/dW plus any global linear dW override."""
     if scheme == "none":
         return {"attention": "none", "ffn": "none", "router": "none", "lm_head": "none"}
     if scheme not in MODEL_SCHEMES:
         raise ValueError(f"Unknown simulation scheme: {scheme!r}")
+    if scheme in DW_MXFP8_SCHEMES:
+        return {**projection_policy(DW_MXFP8_SCHEMES[scheme]), "dW": "mxfp8"}
     base, group = _MIXED_POLICIES.get(scheme, (scheme, None))
     ffn = base
     if group == "all":
@@ -55,7 +59,7 @@ def validate_resume_policy(checkpoint, scheme, *, seed=None):
     if scheme in RESIDUAL_SCHEMES and checkpoint.get("residual_policy") != RESIDUAL_POLICY:
         raise ValueError(f"{scheme} resume requires residual_policy={RESIDUAL_POLICY}; "
                          "start a fresh run with --from_resume 0 for the revised residual experiment.")
-    if scheme in MIXED_SCHEMES:
+    if scheme in POLICY_SCHEMES:
         if checkpoint.get("projection_policy") != projection_policy(scheme):
             raise ValueError(f"Checkpoint projection_policy does not match {scheme}")
         if seed is not None and checkpoint.get("seed") != seed:

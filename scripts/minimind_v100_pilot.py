@@ -106,7 +106,7 @@ def evaluate(root, moe, scheme, eval_scheme, device="cuda:0", *, seed=42, reuse=
     """Score a pilot checkpoint on the reserved documents with token-weighted NLL."""
     validate_case(moe, scheme, seed)
     from model.quant_policy import (
-        MIXED_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES, projection_policy, scheme_artifact_name,
+        POLICY_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES, projection_policy, scheme_artifact_name,
     )
 
     if eval_scheme not in ("same", "bf16"):
@@ -130,7 +130,7 @@ def evaluate(root, moe, scheme, eval_scheme, device="cuda:0", *, seed=42, reuse=
         "checkpoint": weights.name, "valid_sha256": hashlib.sha256(valid.read_bytes()).hexdigest(),
         "seq_len": 512, "batch_size": 2,
     }
-    if scheme in MIXED_SCHEMES:
+    if scheme in POLICY_SCHEMES:
         identity["train_projection_policy"] = projection_policy(scheme)
         identity["eval_projection_policy"] = projection_policy(forward_scheme)
     if scheme in RESIDUAL_SCHEMES:
@@ -370,7 +370,7 @@ def main():
     train_args = commands.add_parser("train", help="Pretrain from scratch on the fixed 32k subset, one eight-GPU job")
     eval_args = commands.add_parser("eval", help="Evaluate one pilot checkpoint on the held-out dataset")
     for p in (train_args, eval_args):
-        p.add_argument("scheme", help="Training scheme (bf16, mxfp8, a 3MM format, or a mixed MoE scheme)")
+        p.add_argument("scheme", help="Training scheme (bf16, mxfp8, a 3MM format, a *_dw_mxfp8 variant or a MoE FFN scheme)")
         p.add_argument("--moe", action="store_true", help="Use MiniMind-3-MoE; default Dense")
     ablation = commands.add_parser("moe-ffn-mxfp8", help="Compare MXFP8 subsets of the three expert projections")
     ablation.add_argument("--groups", nargs="+", default=("all",), metavar="GROUP",

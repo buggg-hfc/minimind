@@ -5,15 +5,22 @@ import fcntl
 from pathlib import Path
 
 from minimind_grid_reuse import previous_moe_scores
-from minimind_grid_train import ARCHITECTURES, SCHEMES, prepare, score_arm
+from minimind_grid_train import ARCHITECTURES, DW_SCHEMES, SCHEMES, prepare, score_arm
 from minimind_moe_paired_seeds import DEFAULT_DATA, DEFAULT_OUTPUT as PAIRED_OUTPUT, record_pairs
 
 
-def run(args):
+def run(args, *, schemes=SCHEMES, plan_only=False):
     seeds = args.seeds
     if not seeds or len(set(seeds)) != len(seeds) or any(not 0 <= s <= 2**32 - 8 for s in seeds):
         raise ValueError("种子必须互异，并为八个 rank 的 seed+rank 留出 uint32 范围")
     output = args.output.expanduser().resolve()
+    cases = [(seed, arch, scheme) for seed in seeds for arch in ARCHITECTURES for scheme in schemes]
+    if plan_only:
+        print("seed,architecture,train_scheme,eval_scheme")
+        for seed, arch, scheme in cases:
+            print(f"{seed},{arch},{scheme},{scheme}")
+        print(f"{len(cases)} 组，每组 512 次 AdamW 更新。汇总文件 {output / 'same_format.csv'}")
+        return
     previous = args.previous_paired.expanduser().resolve() if args.previous_paired else None
     if previous and (previous == output or previous in output.parents or output in previous.parents):
         raise ValueError("本次输出和历史配对任务请使用两个独立目录")
@@ -24,8 +31,7 @@ def run(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(f"已有训练任务在使用 {output}") from exc
-        work = prepare(output, args.data.expanduser().resolve(), seeds)
-        cases = [(seed, arch, scheme) for seed in seeds for arch in ARCHITECTURES for scheme in SCHEMES]
+        work = prepare(output, args.data.expanduser().resolve(), seeds, schemes)
         # Keep already published rows visible while revalidating them after a restart.
         rows = {}
         if report.is_file():
@@ -57,9 +63,22 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[43, 44, 45, 46])
+    parser.add_argument("--dw-mxfp8", action="store_true", help="三种 4-bit 的 dW 回退对照，默认 seed 42 43 100 2026")
+    parser.add_argument("--plan", action="store_true", help="仅打印所有训推组合，不读取数据或启动 GPU")
+    parser.add_argument("--seeds", type=int, nargs="+")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
-    parser.add_argument("--output", type=Path, default=Path("/data/lz/minimind-five-format-grid"))
-    parser.add_argument("--previous-paired", type=Path, default=PAIRED_OUTPUT,
+    parser.add_argument("--output", type=Path, help="单独的实验目录，使用相同参数重跑可续训")
+    parser.add_argument("--previous-paired", type=Path,
                         help="上一次 MoE 双格式配对训练的目录，用于等待并复用已完成的相同训练")
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if args.dw_mxfp8:
+        if args.previous_paired is not None:
+            parser.error("--previous-paired 仅用于原五格式网格，历史模型没有 dW 回退策略")
+        args.seeds = args.seeds or [42, 43, 100, 2026]
+        args.output = args.output or Path("/data/lz/minimind-dw-mxfp8-grid")
+        run(args, schemes=DW_SCHEMES, plan_only=args.plan)
+    else:
+        args.seeds = args.seeds or [43, 44, 45, 46]
+        args.output = args.output or Path("/data/lz/minimind-five-format-grid")
+        args.previous_paired = args.previous_paired or PAIRED_OUTPUT
+        run(args, plan_only=args.plan)

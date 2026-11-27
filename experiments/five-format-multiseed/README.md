@@ -185,3 +185,27 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 可以只传一档 `--lr`，也可以用 `--schemes hif4_thr_3mm`、`--schemes nvint4_3mm` 或 `--schemes nvfp4_3mm` 单跑。若低 LR 只跑 4-bit，随后用 `--lr 1e-4 --schemes mxfp8` 补齐对照，脚本会重算汇总。
 
 默认数据目录为 `/home/lz/minimind/runs/v100-pilot/data`，旧对照表为 `/data/lz/minimind-moe-noise-s42/noise_runs.csv`，可用 `--data` 和 `--noise-runs` 指定。新实验按 LR 分目录写入 `/data/lz/minimind-moe-4bit-warmup-s42`。每训练并验证完一组即更新 `warmup_comparison.csv`。其中 `mean_ce` 和 `ppl` 来自 236,442 个有效验证 token，`gap_vs_mxfp8_warmup` 为相同 LR、相同日程下本格式 CE 减 MXFP8 CE，`low_lr_minus_base_lr_warmup_ce` 为同格式 warmup 下 1e-4 的 CE 减 5e-4 的 CE。缺少配对结果时相应差值留空。
+
+## 24 组全投影 dW 回退到 MXFP8 的实验
+
+每个 seed（42、43、100、2026）分别训练 Dense 和 MoE，各运行 HiF4 THR、NVINT4、NVFP4 三种 R2 3MM 方案。新方案名在基础格式后追加 `_dw_mxfp8`。每组从头使用同一份 32k pilot 训练 512 次 AdamW 更新，学习率峰值 5e-4，无 warmup。终点按本组前向格式评估 236,442 个有效验证 token，记录验证 CE 和 PPL。
+
+| 线性投影 | 前向及 dX | dW |
+|---|---|---|
+| 注意力 q/k/v/o、Dense FFN 或所有 MoE 专家的 up/gate/down | 各自基础 4-bit R2 3MM | MXFP8 单次矩阵乘 |
+| MoE 路由器 gate、输出头 lm_head | BF16 模拟 | MXFP8 单次矩阵乘 |
+
+将同一层的输入和上游梯度展平为 `X[tokens, in]` 和 `dY[tokens, out]`，按仓库已有 MXFP8 规则沿 token 维分组，计算 `dW = dY.T @ X`。输出头与词嵌入共享权重，查表产生的梯度仍通过原路径累加。历史全 4-bit 对照中的 router 和输出头使用 BF16 计算 dW，解读新旧差值时也要计入这两处切换。
+
+从此版本仓库根目录执行。第一条命令打印全部组合，第二条在一台 8×V100 上顺序完成训练与同格式验证。
+
+```bash
+PY=/root/anaconda3/envs/lz/bin/python
+"$PY" scripts/minimind_multiseed_grid.py --dw-mxfp8 --plan
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$PY" scripts/minimind_multiseed_grid.py \
+  --dw-mxfp8 --seeds 42 43 100 2026 \
+  --data /home/lz/minimind/runs/v100-pilot/data \
+  --output /data/lz/minimind-dw-mxfp8-grid
+```
+
+汇总文件为 `/data/lz/minimind-dw-mxfp8-grid/same_format.csv`，每完成一组就写入一行。中断后用相同命令和输出目录续跑，脚本校验数据、代码和断点。做配对分析时，从新 CSV 的 `train_scheme` 去掉 `_dw_mxfp8`，对照同架构、同 seed、同基础格式的历史 CE，再对四个配对差值取平均。[历史 40 组同格式验证结果](same_format_validation.csv)

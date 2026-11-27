@@ -129,6 +129,7 @@ class OperatorProbe:
         self.stats = {}
         self.handles = []
         policy = projection_policy(scheme)
+        self.dw_scheme_override = policy.get("dW")
         for layer in sorted(set(layers)):
             if not 0 <= layer < len(model.model.layers):
                 raise ValueError(f"Invalid layer {layer}")
@@ -154,6 +155,11 @@ class OperatorProbe:
             for stage in ("raw", "applied"):
                 self.stats[path, op, stage] = _PairedStats()
 
+    def _primitive(self, path, op):
+        if op == "dW" and self.dw_scheme_override is not None:
+            return self.dw_scheme_override
+        return self.modules[path][1]["primitive"]
+
     def _observe(self, path, op, lhs, rhs, rows):
         population = lhs.shape[0] * rhs.shape[1]
         if population == 0:
@@ -172,7 +178,7 @@ class OperatorProbe:
             return selected.cpu().numpy(), _bf16_value(selected).cpu().numpy()
 
         reference = sample("bf16")
-        fmt = self.modules[path][1]["primitive"]
+        fmt = self._primitive(path, op)
         estimate = reference if fmt == "bf16" else sample(fmt)
         for stage, ref, est in zip(("raw", "applied"), reference, estimate):
             self.stats[path, op, stage].add(ref, est, rows, population)
@@ -205,7 +211,7 @@ class OperatorProbe:
         self.handles.clear()
 
     def rows(self):
-        return [dict(self.modules[path][1], gemm=op, stage=stage, **stats.result())
+        return [dict(self.modules[path][1], primitive=self._primitive(path, op), gemm=op, stage=stage, **stats.result())
                 for (path, op, stage), stats in self.stats.items()]
 
     def component_rows(self):
@@ -213,7 +219,7 @@ class OperatorProbe:
         groups = {}
         for (path, op, stage), stats in self.stats.items():
             meta = self.modules[path][1]
-            key = meta["projection"], meta["primitive"], op, stage
+            key = meta["projection"], self._primitive(path, op), op, stage
             if key not in groups:
                 groups[key] = _PairedStats()
             groups[key].merge(stats)

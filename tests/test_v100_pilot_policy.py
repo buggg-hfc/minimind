@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from model.quant_policy import (MIXED_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES, projection_policy,
+from model.quant_policy import (POLICY_SCHEMES, RESIDUAL_POLICY, RESIDUAL_SCHEMES, projection_policy,
                                 scheme_artifact_name, validate_resume_policy)
 from scripts import minimind_v100_pilot as pilot
 
@@ -13,7 +13,7 @@ class PilotPolicyTest(unittest.TestCase):
         for scheme in RESIDUAL_SCHEMES:
             self.assertEqual(scheme_artifact_name(scheme), scheme + "_r2")
             checkpoint = {"quant_sim": scheme, "residual_policy": RESIDUAL_POLICY}
-            if scheme in MIXED_SCHEMES:
+            if scheme in POLICY_SCHEMES:
                 with self.assertRaisesRegex(ValueError, "projection_policy"):
                     validate_resume_policy(checkpoint, scheme)
                 checkpoint["projection_policy"] = projection_policy(scheme)
